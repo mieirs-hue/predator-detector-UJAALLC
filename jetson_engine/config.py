@@ -1,37 +1,56 @@
 __all__ = ['ZONE_TOPOLOGY']
 
 ZONE_TOPOLOGY = {
-    # Replace with actual ESP32 MAC addresses
-    "4B:BD:CE:1B:BF:01": {
-        "zone_id": "ZONE_NORTH",
+    "FSS-N01": {
+        "zone_id": "ZONE_NORTH_OFFICE",
         "category": "Interior",
         "label": "Uncle Jesse's Office",
         "color": "#00FF88",  # Green - Primary Active
-        "baseline_rssi": -65 
+        "baseline_rssi": -65,
+        "mount_height_ft": 9,
+        "vertical_reference": {
+            "above": "ZONE_UPSTAIRS",
+            "below": "ZONE_OFFICE"
+        }
     },
-    "4B:BD:CE:1B:BF:02": {
-        "zone_id": "ZONE_EAST",
+    "FSS-N02": {
+        "zone_id": "ZONE_EAST_GARAGE",
         "category": "Vehicle",
         "label": "Garage",
         "color": "#3399FF",  # Blue - Equipment
-        "baseline_rssi": -70
+        "baseline_rssi": -70,
+        "mount_height_ft": 6,
+        "vertical_reference": {
+            "above": "NONE",
+            "below": "ZONE_GARAGE"
+        }
     },
-    "4B:BD:CE:1B:BF:03": {
-        "zone_id": "ZONE_SOUTH",
+    "FSS-N03": {
+        "zone_id": "ZONE_SOUTH_BASELINE",
         "category": "Reference",
         "label": "No-Movement Zone",
         "color": "#A0A0A0",  # Gray - Baseline/Control
-        "baseline_rssi": -85
+        "baseline_rssi": -85,
+        "mount_height_ft": 4,
+        "vertical_reference": {
+            "above": "NONE",
+            "below": "NONE"
+        }
     },
-    "4B:BD:CE:1B:BF:04": {
-        "zone_id": "ZONE_WEST",
+    "FSS-N04": {
+        "zone_id": "ZONE_WEST_ENTRY",
         "category": "Entry",
         "label": "Front Door",
         "color": "#FFD700",  # Gold - Entry Monitor
-        "baseline_rssi": -60
+        "baseline_rssi": -60,
+        "mount_height_ft": 7,
+        "vertical_reference": {
+            "above": "NONE",
+            "below": "ZONE_ENTRY"
+        }
     },
     # --- Expanded Zones ---
-    "4B:BD:CE:1B:BF:05": {
+    "FSS-N05": {
         "zone_id": "ZONE_PATIO",
         "category": "Outdoor",
         "label": "Patio / Deck",
