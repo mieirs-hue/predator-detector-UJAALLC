@@ -17,17 +17,35 @@ system_state = {
     "is_ready": True,
 }
 
+NORMALIZED_NODE_IDS = ["FSS-N01", "FSS-N02", "FSS-N03", "FSS-N04"]
+
 
 class ReplayInjector:
     """Handles injection of historical tracking telemetry frames during replay states."""
 
     def __init__(self, dataset_name: str):
         self.dataset_name = dataset_name
-        self.frames = [
-            {"frame": i, "timestamp": i * 0.1, "status": "REPLAY_ACTIVE"}
-            for i in range(100)
-        ]
+        self.frames = self._build_frames()
         self.cursor = 0
+
+    def _build_frames(self) -> list[dict[str, Any]]:
+        frames: list[dict[str, Any]] = []
+        for index in range(100):
+            node_id = NORMALIZED_NODE_IDS[index % len(NORMALIZED_NODE_IDS)]
+            frames.append(
+                {
+                    "type": "telemetry",
+                    "source": "REPLAY",
+                    "dataset": self.dataset_name,
+                    "node_id": node_id,
+                    "sequence": index,
+                    "timestamp_ms": index * 100,
+                    "distance_cm": 100 + (index % 8) * 11,
+                    "rssi_dbm": -50 - (index % 6),
+                    "status": "REPLAY_ACTIVE",
+                }
+            )
+        return frames
 
     def get_next_frame(self) -> Dict[str, Any]:
         if self.cursor >= len(self.frames):
@@ -43,11 +61,12 @@ class ReplayInjector:
 active_injector: ReplayInjector | None = None
 
 
-def reset_tracking_state() -> None:
+def reset_tracking_state(*, preserve_injector: bool = False) -> None:
     """Performs safety resets to clear residual artifacts and corrupt tracking states."""
     global active_injector
     logging.warning("[SAFETY RESET] Clearing tracking state and resetting accumulators.")
-    active_injector = None
+    if not preserve_injector:
+        active_injector = None
     system_state["frame_index"] = 0
 
 
@@ -62,6 +81,7 @@ async def handle_system_mode(command: str, payload: Dict[str, Any]) -> Dict[str,
     if cmd == "STOP":
         reset_tracking_state()
         system_state["mode_state"] = "STOP"
+        system_state["active_dataset"] = None
     elif cmd == "REPLAY":
         dataset = payload.get("dataset")
         if not dataset or dataset not in system_state["datasets"]:
@@ -72,25 +92,29 @@ async def handle_system_mode(command: str, payload: Dict[str, Any]) -> Dict[str,
             active_injector = ReplayInjector(dataset)
             system_state["active_dataset"] = dataset
             system_state["mode_state"] = "REPLAY"
+            system_state["frame_index"] = active_injector.cursor
     elif cmd == "PAUSE":
-        if system_state["mode_state"] in ["REPLAY", "RESUME"]:
+        if system_state["mode_state"] == "REPLAY":
             system_state["mode_state"] = "PAUSE"
         else:
             success = False
             message = "Cannot pause when system is not actively running or replaying."
     elif cmd == "RESUME":
         if system_state["mode_state"] == "PAUSE" and system_state["active_dataset"]:
-            system_state["mode_state"] = "RESUME"
+            system_state["mode_state"] = "REPLAY"
         else:
             success = False
             message = "No active session paused to resume."
     elif cmd == "SEEK":
         target_index = int(payload.get("frame_index", 0))
-        reset_tracking_state()
-        if active_injector:
+        if active_injector is None:
+            success = False
+            message = "No active replay injector to seek."
+        else:
+            reset_tracking_state(preserve_injector=True)
             active_injector.seek(target_index)
-        system_state["frame_index"] = target_index
-        message = f"Successfully sought to frame index {target_index}"
+            system_state["frame_index"] = active_injector.cursor
+            message = f"Successfully sought to frame index {active_injector.cursor}"
     else:
         success = False
         message = f"Unknown system command mode: {cmd}"
