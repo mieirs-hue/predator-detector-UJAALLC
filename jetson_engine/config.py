@@ -4,7 +4,7 @@ ZONE_TOPOLOGY = {
     "FSS-N01": {
         "zone_id": "ZONE_NORTH_OFFICE",
         "category": "Interior",
-        "label": "Uncle Jesse's Office",
+        "label": "Office",
         "color": "#00FF88",  # Green - Primary Active
         "baseline_rssi": -65,
         "mount_height_ft": 9,
@@ -28,7 +28,7 @@ ZONE_TOPOLOGY = {
     "FSS-N03": {
         "zone_id": "ZONE_SOUTH_BASELINE",
         "category": "Reference",
-        "label": "No-Movement Zone",
+        "label": "Bay Room",
         "color": "#A0A0A0",  # Gray - Baseline/Control
         "baseline_rssi": -85,
         "mount_height_ft": 4,
@@ -40,7 +40,7 @@ ZONE_TOPOLOGY = {
     "FSS-N04": {
         "zone_id": "ZONE_WEST_ENTRY",
         "category": "Entry",
-        "label": "Front Door",
+        "label": "Front Entry",
         "color": "#FFD700",  # Gold - Entry Monitor
         "baseline_rssi": -60,
         "mount_height_ft": 7,

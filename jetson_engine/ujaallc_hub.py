@@ -10,6 +10,7 @@ import websockets
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
+HUB_SERIAL_BAUD_RATE = 921600
 HYSTERESIS_CONFIG = {
     "TRIGGER_THRESHOLD": -58,
     "RELEASE_THRESHOLD": -75,
@@ -66,7 +67,7 @@ def process_zone_hysteresis(zone_id: str, mac_address: str, rssi_sample: float) 
 
 async def serial_endpoint_handler(port_path: str, zone_id: str) -> None:
     try:
-        ser = serial.Serial(port_path, 115200, timeout=1)
+        ser = serial.Serial(port_path, HUB_SERIAL_BAUD_RATE, timeout=1)
         logging.info("[BOOT] Lighthouse %s initialized on %s", zone_id, port_path)
         while True:
             await asyncio.sleep(0.01)
@@ -100,7 +101,7 @@ async def serial_endpoint_handler(port_path: str, zone_id: str) -> None:
         logging.error("[ERROR] Serial line on %s (%s) disconnected: %s", port_path, zone_id, exc)
 
 
-async def visualizer_endpoint_handler(websocket, path: str) -> None:
+async def visualizer_endpoint_handler(websocket) -> None:
     visualizer_clients.add(websocket)
     logging.info("[SYSTEM] Monitoring visualizer connected. Total: %d", len(visualizer_clients))
     try:
