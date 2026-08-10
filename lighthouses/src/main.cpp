@@ -20,7 +20,6 @@
 constexpr uint16_t PORT_AUDIO_RX = 5005;
 constexpr uint16_t PORT_AUDIO_TX = 5006;
 constexpr uint16_t PORT_TELEMETRY = 5007;
-constexpr uint32_t TELEMETRY_INTERVAL_MS = 100;
 
 constexpr int AMP_BCLK = 4;
 constexpr int AMP_LRC = 5;
@@ -31,14 +30,20 @@ constexpr int MIC_SD = 9;
 constexpr int I2C_SDA = 10;
 constexpr int I2C_SCL = 11;
 constexpr uint8_t TFLUNA_I2C_ADDR = 0x10;
+// Moved from D9 to avoid MIC_SD conflict
+constexpr int TF_LUNA_INT = 3;
 
 WiFiUDP udpAudioRx;
 WiFiUDP udpAudioTx;
 WiFiUDP udpTelemetry;
 
-unsigned long lastTelemetryStamp = 0;
+volatile bool newLidarDataReady = false;
 uint16_t lastDistanceCm = 0;
 int16_t lastRssi = -90;
+
+void IRAM_ATTR handleLidarInterrupt() {
+  newLidarDataReady = true;
+}
 
 void initI2SOutput();
 void initI2SInput();
@@ -48,6 +53,9 @@ void emitTelemetry();
 void setup() {
   Serial.begin(921600);
   Wire.begin(I2C_SDA, I2C_SCL, 400000);
+
+  pinMode(TF_LUNA_INT, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(TF_LUNA_INT), handleLidarInterrupt, RISING);
 
   initI2SOutput();
   initI2SInput();
@@ -85,14 +93,16 @@ void loop() {
     udpAudioTx.endPacket();
   }
 
-  if (millis() - lastTelemetryStamp >= TELEMETRY_INTERVAL_MS) {
-    lastTelemetryStamp = millis();
+  if (newLidarDataReady) {
+    newLidarDataReady = false;
     emitTelemetry();
   }
 }
 
 void emitTelemetry() {
-  lastDistanceCm = getLiDaRDistance();
+  uint16_t reading = getLiDaRDistance();
+  if (reading == 0xFFFF) return;  // skip corrupt frame
+  lastDistanceCm = reading;
   lastRssi = constrain(lastRssi + ((random(0, 10) > 5) ? 1 : -1), -95, -45);
 
   StaticJsonDocument<256> doc;
@@ -158,14 +168,17 @@ void initI2SInput() {
 
 uint16_t getLiDaRDistance() {
   Wire.beginTransmission(TFLUNA_I2C_ADDR);
-  Wire.write(0x00);
-  if (Wire.endTransmission() != 0) return 0;
+  Wire.write(0x01);
+  Wire.endTransmission(false);
 
-  Wire.requestFrom((uint8_t)TFLUNA_I2C_ADDR, (uint8_t)2);
-  if (Wire.available() >= 2) {
-    uint8_t lowByte = Wire.read();
-    uint8_t highByte = Wire.read();
-    return (uint16_t)((highByte << 8) | lowByte);
+  // 9-byte frame: [0x59][0x59][strength_L][dist_L][dist_H][str_H][res][sig][checksum]
+  byte received = Wire.requestFrom((int)TFLUNA_I2C_ADDR, 9);
+  if (received == 9) {
+    uint8_t buf[9];
+    for (int i = 0; i < 9; i++) buf[i] = Wire.read();
+    if (buf[0] == 0x59 && buf[1] == 0x59) {
+      return (uint16_t)((buf[3] << 8) | buf[2]);
+    }
   }
-  return 0;
+  return 0xFFFF;
 }
