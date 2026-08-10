@@ -196,6 +196,7 @@ HTML_PAGE = """
   <meta charset=\"utf-8\" />
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
   <title>FSS Fleet Dashboard | Neon Matrix</title>
+  <script src=\"https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js\"></script>
   <style>
     :root { color-scheme: dark; --text:#e8ffe1; --muted:#89a38d; --neon:#39ff14; --cyan:#44d7ff; --amber:#ffd166; --shadow:0 0 0 1px rgba(57,255,20,.08),0 0 24px rgba(57,255,20,.12); --panel-border:rgba(57,255,20,.22); }
     html { font-size: 18px; }
@@ -208,21 +209,12 @@ HTML_PAGE = """
     .dashboard-grid { display:grid; grid-template-columns:minmax(0,2.1fr) minmax(340px,.9fr); gap:18px; align-items:start; }
     .stack { display:grid; gap:18px; }
     .scene, .card, .status-card, .node-control { border:1px solid var(--panel-border); border-radius:18px; box-shadow:var(--shadow); background:linear-gradient(180deg, rgba(10,18,14,.96), rgba(6,10,8,.96)); backdrop-filter:blur(10px); }
-    .scene { position:relative; min-height:460px; overflow:hidden; background: radial-gradient(circle at top, rgba(57,255,20,.10), transparent 34%), linear-gradient(180deg, rgba(8,14,11,.98), rgba(3,6,5,.98)); }
+    .scene { position:relative; min-height:520px; overflow:hidden; background: radial-gradient(circle at top, rgba(57,255,20,.10), transparent 34%), linear-gradient(180deg, rgba(8,14,11,.98), rgba(3,6,5,.98)); }
     .scene-header { display:flex; justify-content:space-between; gap:12px; padding:20px 20px 12px; }
     .scene-header h2, .card h3, .status-card h3, .node-control h4 { margin:0; text-transform:uppercase; letter-spacing:.12em; }
     .scene-header h2 { font-size:1.2rem; color:var(--cyan); }
     .scene-header .hint, .status-card p, .node-meta, .control-button small { color:var(--muted); }
-    .room-stage { position:relative; height:360px; margin:8px 18px 18px; perspective:1300px; }
-    .roof-layer { position:absolute; inset:12px 18px auto; height:64px; border:1px dashed rgba(68,215,255,.55); border-radius:16px; background:linear-gradient(180deg, rgba(68,215,255,.14), rgba(68,215,255,.04)); color:var(--cyan); display:flex; align-items:center; justify-content:center; letter-spacing:.16em; text-transform:uppercase; font-size:.9rem; transform:translateZ(22px); }
-    .room-grid { position:absolute; inset:92px 0 0; display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:14px; padding:0 18px 18px; transform:rotateX(58deg) translateY(-14px); transform-origin:top center; }
-    .room-card { position:relative; min-height:126px; padding:16px; border-radius:16px; border:1px solid rgba(57,255,20,.18); background:linear-gradient(180deg, rgba(16,28,21,.95), rgba(8,13,11,.96)); overflow:hidden; }
-    .room-card[data-active="true"] { border-color:rgba(57,255,20,.85); box-shadow: inset 0 0 28px rgba(57,255,20,.10), 0 0 24px rgba(57,255,20,.15); }
-    .room-title { position:relative; z-index:1; margin-bottom:8px; font-size:1rem; text-transform:uppercase; letter-spacing:.12em; }
-    .room-meta { position:relative; z-index:1; display:grid; gap:6px; font-size:.9rem; color:var(--muted); }
-    .room-pulse { position:absolute; right:14px; bottom:14px; width:14px; height:14px; border-radius:999px; background:var(--neon); box-shadow:0 0 16px var(--neon); opacity:.65; }
-    .room-card[data-active="true"] .room-pulse { opacity:1; animation:pulse 1.2s ease-in-out infinite; }
-    @keyframes pulse { 0%,100%{transform:scale(.9)} 50%{transform:scale(1.2)} }
+    #canvas-container { width:100%; height:440px; }
     .status { display:inline-flex; align-items:center; gap:.6rem; color:var(--neon); font-size:1.05rem; letter-spacing:.08em; text-transform:uppercase; margin-bottom:20px; }
     .status::before { content:"●"; color:var(--cyan); text-shadow:0 0 10px var(--cyan); }
     .control-panel { position:sticky; top:18px; display:grid; gap:18px; }
@@ -244,7 +236,7 @@ HTML_PAGE = """
     tbody tr:hover { background:rgba(57,255,20,.06); }
     pre { margin:0; white-space:pre-wrap; word-break:break-word; font-size:1rem; line-height:1.55; color:#d8ffe0; }
     @media (max-width: 1100px) { .dashboard-grid { grid-template-columns:1fr; } .control-panel { position:static; } }
-    @media (max-width: 720px) { html { font-size: 16px; } .shell { padding:16px; } .room-grid { grid-template-columns:1fr; transform:none; inset:92px 0 0; } }
+    @media (max-width: 720px) { html { font-size: 16px; } .shell { padding:16px; } #canvas-container { height:300px; } }
   </style>
 </head>
 <body>
@@ -254,8 +246,8 @@ HTML_PAGE = """
       <div class=\"stack\">
         <div class=\"status\" id=\"status\">Connecting to edge hub…</div>
         <div class=\"scene\">
-          <div class=\"scene-header\"><h2>Four-Room Spatial View</h2><div class=\"hint\">20 ft x 20 ft x 10 ft per room, rooftop overlay above</div></div>
-          <div class=\"room-stage\"><div class=\"roof-layer\">Rooftop Monitoring Layer</div><div class=\"room-grid\" id=\"roomGrid\"></div></div>
+          <div class=\"scene-header\"><h2>40×40 ft Engineering Floorplan</h2><div class=\"hint\">1 unit = 1 foot · 4 rooms × 20ft² · 9ft sensor height</div></div>
+          <div id=\"canvas-container\"></div>
         </div>
         <div class=\"card\"><h3>Node Status</h3><table><thead><tr><th>Node</th><th>Motion</th><th>Signal</th><th>State</th><th>Last Update</th></tr></thead><tbody id=\"rows\"></tbody></table></div>
         <div class=\"card\"><h3>Latest packet</h3><pre id=\"latest\">Waiting for telemetry…</pre></div>
@@ -268,10 +260,159 @@ HTML_PAGE = """
     </div>
   </div>
   <script>
+    const FLOOR_WIDTH = 40;
+    const FLOOR_DEPTH = 40;
+    const ROOM_WIDTH = 20;
+    const ROOM_DEPTH = 20;
+    const WALL_HEIGHT = 9;
+    const WALL_THICKNESS = 0.25;
+    const SENSOR_HEIGHT = 9;
+    
+    const ROOMS = {
+      "FSS-N01": { id: "FSS-N01", name: "OFFICE", center: [-10, 0, -10], bounds: { minX: -20, maxX: 0, minZ: -20, maxZ: 0 } },
+      "FSS-N02": { id: "FSS-N02", name: "GARAGE", center: [10, 0, -10], bounds: { minX: 0, maxX: 20, minZ: -20, maxZ: 0 } },
+      "FSS-N03": { id: "FSS-N03", name: "ROOM 3", center: [-10, 0, 10], bounds: { minX: -20, maxX: 0, minZ: 0, maxZ: 20 } },
+      "FSS-N04": { id: "FSS-N04", name: "FRONT ENTRY", center: [10, 0, 10], bounds: { minX: 0, maxX: 20, minZ: 0, maxZ: 20 } }
+    };
+    
+    let scene, camera, renderer, orbitControls;
+    
+    function initThreeJS() {
+      const container = document.getElementById('canvas-container');
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      
+      scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x030605);
+      
+      camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+      camera.position.set(0, 38, 42);
+      camera.lookAt(0, 0, 0);
+      
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(width, height);
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.shadowMap.enabled = true;
+      container.appendChild(renderer.domElement);
+      
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambientLight);
+      
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      directionalLight.position.set(20, 30, 20);
+      directionalLight.castShadow = true;
+      scene.add(directionalLight);
+      
+      // FLOOR
+      const floorGeometry = new THREE.BoxGeometry(FLOOR_WIDTH, 0.15, FLOOR_DEPTH);
+      const floorMaterial = new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.85, metalness: 0.05 });
+      const floor = new THREE.Mesh(floorGeometry, floorMaterial);
+      floor.position.set(0, -0.075, 0);
+      floor.castShadow = true;
+      floor.receiveShadow = true;
+      scene.add(floor);
+      
+      // ENGINEERING GRID
+      const engineeringGrid = new THREE.GridHelper(40, 40, 0x475569, 0x1e293b);
+      engineeringGrid.position.y = 0.01;
+      scene.add(engineeringGrid);
+      
+      // WALLS
+      const wallMaterial = new THREE.MeshStandardMaterial({ color: 0x64748b, transparent: true, opacity: 0.35, roughness: 0.8 });
+      
+      function createWall(width, depth, x, y, z) {
+        const geometry = new THREE.BoxGeometry(
+          width,
+          WALL_HEIGHT,
+          width === WALL_THICKNESS ? FLOOR_DEPTH : WALL_THICKNESS
+        );
+        const wall = new THREE.Mesh(geometry, wallMaterial);
+        wall.position.set(x, y, z);
+        wall.castShadow = true;
+        wall.receiveShadow = true;
+        scene.add(wall);
+      }
+      
+      // NORTH/SOUTH walls
+      createWall(FLOOR_WIDTH, WALL_HEIGHT, 0, WALL_HEIGHT / 2, -20);
+      createWall(FLOOR_WIDTH, WALL_HEIGHT, 0, WALL_HEIGHT / 2, 20);
+      
+      // EAST/WEST walls
+      createWall(WALL_THICKNESS, WALL_HEIGHT, -20, WALL_HEIGHT / 2, 0);
+      createWall(WALL_THICKNESS, WALL_HEIGHT, 20, WALL_HEIGHT / 2, 0);
+      
+      // INTERNAL walls
+      createWall(WALL_THICKNESS, WALL_HEIGHT, 0, WALL_HEIGHT / 2, 0);  // North/South divider
+      const horizontalWallGeometry = new THREE.BoxGeometry(FLOOR_WIDTH, WALL_HEIGHT, WALL_THICKNESS);
+      const horizontalWall = new THREE.Mesh(horizontalWallGeometry, wallMaterial);
+      horizontalWall.position.set(0, WALL_HEIGHT / 2, 0);
+      horizontalWall.castShadow = true;
+      horizontalWall.receiveShadow = true;
+      scene.add(horizontalWall);
+      
+      // SENSOR POSITIONS
+      Object.values(ROOMS).forEach(room => {
+        const markerGeometry = new THREE.SphereGeometry(0.65, 24, 24);
+        const markerMaterial = new THREE.MeshStandardMaterial({ color: 0x38bdf8, emissive: 0x123b59 });
+        const marker = new THREE.Mesh(markerGeometry, markerMaterial);
+        marker.position.set(room.center[0], SENSOR_HEIGHT, room.center[2]);
+        marker.userData.nodeId = room.id;
+        marker.castShadow = true;
+        scene.add(marker);
+        room.sensorMesh = marker;
+      });
+      
+      // ROOM FLOOR CENTERS
+      Object.values(ROOMS).forEach(room => {
+        const geometry = new THREE.PlaneGeometry(ROOM_WIDTH - 0.5, ROOM_DEPTH - 0.5);
+        const material = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.025, side: THREE.DoubleSide });
+        const zone = new THREE.Mesh(geometry, material);
+        zone.rotation.x = -Math.PI / 2;
+        zone.position.set(room.center[0], 0.02, room.center[2]);
+        zone.userData.room = room.id;
+        scene.add(zone);
+        room.zoneMesh = zone;
+      });
+      
+      // DIMENSION ANNOTATIONS (using text sprites)
+      const canvas = document.createElement('canvas');
+      canvas.width = 256;
+      canvas.height = 256;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = '#44d7ff';
+      ctx.font = 'bold 48px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('40 ft', 128, 128);
+      
+      const texture = new THREE.CanvasTexture(canvas);
+      const spriteMaterial = new THREE.SpriteMaterial({ map: texture, sizeAttenuation: true });
+      const sprite = new THREE.Sprite(spriteMaterial);
+      sprite.scale.set(8, 8, 1);
+      sprite.position.set(0, 22, -25);
+      scene.add(sprite);
+      
+      window.addEventListener('resize', onWindowResize);
+      animate();
+    }
+    
+    function onWindowResize() {
+      const container = document.getElementById('canvas-container');
+      const width = container.clientWidth;
+      const height = container.clientHeight;
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+      renderer.setSize(width, height);
+    }
+    
+    function animate() {
+      requestAnimationFrame(animate);
+      renderer.render(scene, camera);
+    }
+    
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
     const socket = new WebSocket(`${protocol}://${location.host}/ws/dashboard`);
     const statusEl = document.getElementById('status');
-    const roomGridEl = document.getElementById('roomGrid');
     const rowsEl = document.getElementById('rows');
     const latestEl = document.getElementById('latest');
     const controlPanelEl = document.getElementById('controlPanel');
@@ -298,17 +439,10 @@ HTML_PAGE = """
       controlStateEl.textContent = state.message || 'Idle';
       broadcastStateEl.textContent = state.hub?.status || 'No commands sent yet';
 
-      roomGridEl.innerHTML = '';
       controlPanelEl.innerHTML = '';
       rowsEl.innerHTML = '';
 
       for (const node of nodes) {
-        const roomCard = document.createElement('div');
-        roomCard.className = 'room-card';
-        roomCard.dataset.active = String(Boolean(node.motion));
-        roomCard.innerHTML = `<div class=\"room-title\">${node.node_id} · ${node.label}</div><div class=\"room-meta\"><span>Motion: ${node.motion_label}</span><span>Signal: ${node.rssi ?? 'n/a'} dBm</span><span>Last seen: ${formatAgo(node.last_seen)}</span></div><div class=\"room-pulse\"></div>`;
-        roomGridEl.appendChild(roomCard);
-
         const nodeControl = document.createElement('div');
         nodeControl.className = 'node-control';
         nodeControl.innerHTML = `<h4>${node.node_id} · ${node.label}</h4><div class=\"node-meta\"><span class=\"node-pill\">${node.motion_label}</span><span>${node.source}</span></div>`;
@@ -341,7 +475,10 @@ HTML_PAGE = """
       latestEl.textContent = JSON.stringify(state.latest_packet || {}, null, 2);
     }
 
-    socket.onopen = () => { controlStateEl.textContent = 'Connected to dashboard websocket'; };
+    socket.onopen = () => { 
+      controlStateEl.textContent = 'Connected to dashboard websocket';
+      initThreeJS();
+    };
     socket.onmessage = (event) => {
       try {
         const message = JSON.parse(event.data);
