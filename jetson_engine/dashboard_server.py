@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Any, Dict, List, Set
@@ -569,8 +570,8 @@ async def connect_to_hub() -> None:
                   if applied_node is not None:
                         await broadcast_state(f"{applied_node} telemetry updated")
         except Exception as exc:
-            print(f"[dashboard] hub connection error: {exc}")
-        await asyncio.sleep(1)
+            logging.debug("[dashboard] hub not reachable: %s", exc)
+        await asyncio.sleep(10)
 
 
 @app.on_event("startup")
