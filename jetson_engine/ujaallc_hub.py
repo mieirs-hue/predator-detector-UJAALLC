@@ -30,6 +30,7 @@ HYSTERESIS_CONFIG = {
 
 active_locks: Dict[str, dict] = {}
 visualizer_clients: Set[object] = set()
+active_serial_ports: Dict[str, serial.Serial] = {}
 
 
 async def handle_websocket_message(websocket, message: str) -> None:
@@ -38,25 +39,52 @@ async def handle_websocket_message(websocket, message: str) -> None:
     except json.JSONDecodeError:
         return
 
-    if data.get("event") != "speaker_test":
+    event_type = data.get("event")
+
+    if event_type == "speaker_test":
+        node_id = data.get("node_id", "unknown")
+        zone = data.get("zone", "unknown")
+        duration_ms = data.get("duration_ms", 500)
+        start_hz = data.get("sweep_start_hz", 400)
+        end_hz = data.get("sweep_end_hz", 1400)
+        logging.info(
+            "[AUDIO TEST] %s (%s) %sms sweep %sHz->%sHz",
+            node_id,
+            zone,
+            duration_ms,
+            start_hz,
+            end_hz,
+        )
+        await route_audio_command(node_id, "BEEP")
         return
 
-    node_id = data.get("node_id", "unknown")
-    zone = data.get("zone", "unknown")
-    duration_ms = data.get("duration_ms", 500)
-    start_hz = data.get("sweep_start_hz", 400)
-    end_hz = data.get("sweep_end_hz", 1400)
-    logging.info(
-        "[AUDIO TEST] %s (%s) %sms sweep %sHz->%sHz",
-        node_id,
-        zone,
-        duration_ms,
-        start_hz,
-        end_hz,
-    )
+    if event_type == "node_audio_command":
+        node_id = data.get("node_id", "unknown")
+        feature = str(data.get("feature", "")).lower()
+        enabled = bool(data.get("enabled", False))
+        if not enabled:
+            return
 
-    # Placeholder for downstream physical trigger routing, for example serial write to target node.
-    # await route_speaker_test_to_node(node_id, duration_ms, start_hz, end_hz)
+        if feature == "siren":
+            await route_audio_command(node_id, "SIREN")
+            return
+        if feature == "intercom":
+            await route_audio_command(node_id, "BEEP")
+            return
+
+
+async def route_audio_command(node_id: str, command: str) -> None:
+    ser = active_serial_ports.get(node_id)
+    if ser is None:
+        logging.warning("[AUDIO COMMAND] %s requested for %s but node is offline", command, node_id)
+        return
+
+    payload = f"{command}\n".encode("utf-8")
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, ser.write, payload)
+        logging.info("[AUDIO COMMAND] Sent %s to %s", command, node_id)
+    except Exception as exc:
+        logging.error("[AUDIO COMMAND] Failed %s to %s: %s", command, node_id, exc)
 
 
 def process_zone_hysteresis(zone_id: str, mac_address: str, rssi_sample: float) -> dict:
@@ -97,8 +125,10 @@ def process_zone_hysteresis(zone_id: str, mac_address: str, rssi_sample: float) 
 
 
 async def serial_endpoint_handler(port_path: str, node_name: str) -> None:
+    ser: serial.Serial | None = None
     try:
         ser = serial.Serial(port_path, HUB_SERIAL_BAUD_RATE, timeout=1)
+        active_serial_ports[node_name] = ser
         logging.info("[BOOT] %s initialized on %s", node_name, port_path)
         loop = asyncio.get_running_loop()
         while True:
@@ -142,6 +172,15 @@ async def serial_endpoint_handler(port_path: str, node_name: str) -> None:
                     visualizer_clients.discard(c)
     except serial.SerialException as exc:
         logging.error("[ERROR] Serial %s (%s) disconnected: %s", port_path, node_name, exc)
+    finally:
+        tracked = active_serial_ports.get(node_name)
+        if ser is not None and tracked is ser:
+            active_serial_ports.pop(node_name, None)
+        try:
+            if ser is not None and ser.is_open:
+                ser.close()
+        except Exception:
+            pass
 
 
 async def visualizer_endpoint_handler(websocket) -> None:

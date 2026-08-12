@@ -1046,6 +1046,17 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 "type": "control_ack",
                 "message": f"{node_id} {feature} set to {'on' if updated_node[f'{feature}_on'] else 'off'}",
             }))
+
+            if feature in {"siren", "intercom"}:
+              audio_payload = {
+                "event": "node_audio_command",
+                "node_id": node_id,
+                "feature": feature,
+                "enabled": bool(updated_node[f"{feature}_on"]),
+                "issued_at": datetime.now().isoformat(),
+              }
+              await send_hub_command(audio_payload)
+
             await broadcast_state(f"{node_id} {feature} updated")
     except WebSocketDisconnect:
         dashboard_clients.discard(websocket)
