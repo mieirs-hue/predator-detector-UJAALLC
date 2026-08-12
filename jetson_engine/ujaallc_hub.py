@@ -71,11 +71,12 @@ async def serial_endpoint_handler(port_path: str, node_name: str) -> None:
     try:
         ser = serial.Serial(port_path, HUB_SERIAL_BAUD_RATE, timeout=1)
         logging.info("[BOOT] %s initialized on %s", node_name, port_path)
+        loop = asyncio.get_running_loop()
         while True:
-            await asyncio.sleep(0.005)
-            if ser.in_waiting == 0:
-                continue
-            raw_line = ser.readline().decode("utf-8", errors="ignore").strip()
+            # readline() blocks; run in executor so asyncio stays responsive
+            raw_line = await loop.run_in_executor(
+                None, lambda: ser.readline().decode("utf-8", errors="ignore").strip()
+            )
             if not raw_line:
                 continue
             try:
@@ -83,7 +84,6 @@ async def serial_endpoint_handler(port_path: str, node_name: str) -> None:
             except json.JSONDecodeError:
                 continue
 
-            # Firmware sets node_id to the string name (e.g. "FSS-N01")
             resolved_name = packet.get("node_id") or node_name
             rssi = float(packet.get("rssi", -99))
             filtered = process_zone_hysteresis(resolved_name, resolved_name, rssi)
@@ -99,7 +99,14 @@ async def serial_endpoint_handler(port_path: str, node_name: str) -> None:
             })
 
             if visualizer_clients:
-                await asyncio.gather(*[c.send(payload) for c in visualizer_clients])
+                dead = set()
+                for c in list(visualizer_clients):
+                    try:
+                        await c.send(payload)
+                    except Exception:
+                        dead.add(c)
+                for c in dead:
+                    visualizer_clients.discard(c)
     except serial.SerialException as exc:
         logging.error("[ERROR] Serial %s (%s) disconnected: %s", port_path, node_name, exc)
 

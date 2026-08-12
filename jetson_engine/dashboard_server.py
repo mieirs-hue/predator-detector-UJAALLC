@@ -15,10 +15,10 @@ app = FastAPI(title="FSS Fleet Dashboard", version="0.1.0")
 HUB_WS_URL = os.getenv("UJAALLC_HUB_URL", "ws://127.0.0.1:8765")
 NODE_ORDER = ["FSS-N01", "FSS-N02", "FSS-N03", "FSS-N04"]
 LIGHTHOUSE_TO_NODE = {
-  "North Entry": "FSS-N01",
-  "South Patio": "FSS-N02",
-  "East Gate": "FSS-N03",
-  "West Driveway": "FSS-N04",
+  "FSS-N01": "FSS-N01",
+  "FSS-N02": "FSS-N02",
+  "FSS-N03": "FSS-N03",
+  "FSS-N04": "FSS-N04",
 }
 
 
@@ -601,12 +601,11 @@ async def connect_to_hub() -> None:
                     try:
                         payload = json.loads(raw_message)
                     except json.JSONDecodeError:
-                        payload = {"raw": raw_message}
-                    await manager.broadcast(payload)
-                if isinstance(payload, dict):
-                  applied_node = apply_telemetry_packet(payload)
-                  if applied_node is not None:
-                        await broadcast_state(f"{applied_node} telemetry updated")
+                        continue
+                    # Pass full hub envelope — apply_telemetry_packet reads zone_data internally
+                    applied_node = apply_telemetry_packet(payload)
+                    if applied_node is not None:
+                        await broadcast_state(f"{applied_node} updated")
         except Exception as exc:
             logging.debug("[dashboard] hub not reachable: %s", exc)
         await asyncio.sleep(10)
