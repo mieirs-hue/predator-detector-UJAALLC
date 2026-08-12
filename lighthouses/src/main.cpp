@@ -16,6 +16,8 @@
 
 const uint32_t I2C_CLOCK_HZ = 100000;
 const uint8_t LIDAR_READ_RETRIES = 3;
+const unsigned long INITIAL_DEBUG_SCAN_MS = 10000; // Continuously scan I2C for 10s on boot
+const unsigned long DEBUG_SCAN_INTERVAL_MS = 200;
 
 volatile bool newLidarDataReady = false;
 volatile int last_i2c_error = 0;
@@ -82,6 +84,7 @@ void IRAM_ATTR handleLidarInterrupt() {
 
 unsigned long sequence_num  = 0;
 unsigned long last_transmit = 0;
+unsigned long last_debug_scan_ms = 0;
 const int TRANSMIT_INTERVAL = 100;
 
 // Robust TF-Luna read path for marginal supply: retries + dual frame parsing
@@ -176,6 +179,13 @@ void setup() {
 
 void loop() {
     unsigned long now = millis();
+
+    // For the first 10s, repeatedly re-scan I2C at a controlled cadence.
+    if (now < INITIAL_DEBUG_SCAN_MS && (now - last_debug_scan_ms) >= DEBUG_SCAN_INTERVAL_MS) {
+        runI2CScan();
+        last_debug_scan_ms = now;
+    }
+
     bool due = newLidarDataReady || (now - last_transmit >= TRANSMIT_INTERVAL);
     if (!due) return;
 
