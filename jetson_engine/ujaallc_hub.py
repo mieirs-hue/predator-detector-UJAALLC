@@ -5,27 +5,25 @@ import os
 from datetime import datetime
 from typing import Dict, Set
 
+import serial
 import websockets
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
-# Ports match firmware constants in lighthouses/src/main.cpp
-PORT_AUDIO_RX  = 5005  # Jetson → node speaker
-PORT_AUDIO_TX  = 5006  # Node mic → Jetson
-PORT_TELEMETRY = 5007  # Node distance data → Jetson
+HUB_SERIAL_BAUD_RATE = 921600
+
+# Serial port → canonical node name (update port paths to match your Jetson)
+ZONE_MAP = {
+    "/dev/ttyACM0": "FSS-N01",
+    "/dev/ttyACM1": "FSS-N02",
+    "/dev/ttyACM2": "FSS-N03",
+    "/dev/ttyACM3": "FSS-N04",
+}
 
 HYSTERESIS_CONFIG = {
     "TRIGGER_THRESHOLD": -58,
     "RELEASE_THRESHOLD": -75,
     "CONSECUTIVE_LOCKS": 10,
-}
-
-# Maps firmware NODE_ID integer to canonical FSS node name
-NODE_ID_MAP: Dict[int, str] = {
-    1: "FSS-N01",
-    2: "FSS-N02",
-    3: "FSS-N03",
-    4: "FSS-N04",
 }
 
 active_locks: Dict[str, dict] = {}
@@ -69,43 +67,41 @@ def process_zone_hysteresis(zone_id: str, mac_address: str, rssi_sample: float) 
     }
 
 
-async def serial_endpoint_handler(port_path: str, zone_id: str) -> None:
-    pass  # Replaced by UDP — kept for import compatibility during transition
+async def serial_endpoint_handler(port_path: str, node_name: str) -> None:
+    try:
+        ser = serial.Serial(port_path, HUB_SERIAL_BAUD_RATE, timeout=1)
+        logging.info("[BOOT] %s initialized on %s", node_name, port_path)
+        while True:
+            await asyncio.sleep(0.005)
+            if ser.in_waiting == 0:
+                continue
+            raw_line = ser.readline().decode("utf-8", errors="ignore").strip()
+            if not raw_line:
+                continue
+            try:
+                packet = json.loads(raw_line)
+            except json.JSONDecodeError:
+                continue
 
+            # Firmware sets node_id to the string name (e.g. "FSS-N01")
+            resolved_name = packet.get("node_id") or node_name
+            rssi = float(packet.get("rssi", -99))
+            filtered = process_zone_hysteresis(resolved_name, resolved_name, rssi)
 
-class TelemetryProtocol(asyncio.DatagramProtocol):
-    """Receives UDP telemetry datagrams from all four ESP32-S3 nodes."""
+            payload = json.dumps({
+                "type": "PERIMETER_TELEMETRY",
+                "zone_data": {
+                    "lighthouse": resolved_name,
+                    "raw_telemetry": packet,
+                    "state": filtered,
+                },
+                "server_time": datetime.now().isoformat(),
+            })
 
-    def datagram_received(self, data: bytes, addr: tuple) -> None:
-        try:
-            packet = json.loads(data.decode("utf-8", errors="ignore"))
-        except json.JSONDecodeError:
-            return
-
-        node_id_int = packet.get("node_id")
-        node_name = NODE_ID_MAP.get(node_id_int, f"FSS-N{node_id_int:02d}")
-        rssi = float(packet.get("rssi", -99))
-
-        filtered_telemetry = process_zone_hysteresis(node_name, node_name, rssi)
-
-        visualization_payload = json.dumps({
-            "type": "PERIMETER_TELEMETRY",
-            "zone_data": {
-                "lighthouse": node_name,
-                "raw_telemetry": packet,
-                "state": filtered_telemetry,
-            },
-            "server_time": datetime.now().isoformat(),
-        })
-
-        if visualizer_clients:
-            loop = asyncio.get_event_loop()
-            loop.create_task(
-                asyncio.gather(*[c.send(visualization_payload) for c in visualizer_clients])
-            )
-
-    def error_received(self, exc: Exception) -> None:
-        logging.error("[UDP] Telemetry socket error: %s", exc)
+            if visualizer_clients:
+                await asyncio.gather(*[c.send(payload) for c in visualizer_clients])
+    except serial.SerialException as exc:
+        logging.error("[ERROR] Serial %s (%s) disconnected: %s", port_path, node_name, exc)
 
 
 async def visualizer_endpoint_handler(websocket) -> None:
@@ -128,18 +124,10 @@ async def visualizer_endpoint_handler(websocket) -> None:
 
 
 async def main() -> None:
-    logging.info("[SYSTEM] Starting UJAALLC hub — UDP telemetry on 0.0.0.0:%d", PORT_TELEMETRY)
-    loop = asyncio.get_running_loop()
-    transport, _ = await loop.create_datagram_endpoint(
-        TelemetryProtocol,
-        local_addr=("0.0.0.0", PORT_TELEMETRY),
-    )
-    logging.info("[SYSTEM] WebSocket visualizer on ws://0.0.0.0:8765")
-    try:
-        await websockets.serve(visualizer_endpoint_handler, "0.0.0.0", 8765)
-        await asyncio.Future()  # run forever
-    finally:
-        transport.close()
+    logging.info("[SYSTEM] Starting UJAALLC hub — serial@%d baud, ws://0.0.0.0:8765", HUB_SERIAL_BAUD_RATE)
+    tasks = [serial_endpoint_handler(port, name) for port, name in ZONE_MAP.items()]
+    tasks.append(websockets.serve(visualizer_endpoint_handler, "0.0.0.0", 8765))
+    await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

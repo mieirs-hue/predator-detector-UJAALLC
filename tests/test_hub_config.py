@@ -5,9 +5,9 @@ from jetson_engine import ujaallc_hub
 
 
 class HubConfigTests(unittest.TestCase):
-    def test_telemetry_port_matches_firmware(self) -> None:
-        # Firmware constant PORT_TELEMETRY in main.cpp must stay in sync
-        self.assertEqual(ujaallc_hub.PORT_TELEMETRY, 5007)
+    def test_serial_baud_rate_matches_firmware(self) -> None:
+        # Must stay in sync with Serial.begin() in lighthouses/src/main.cpp
+        self.assertEqual(ujaallc_hub.HUB_SERIAL_BAUD_RATE, 921600)
 
     def test_visualizer_handler_accepts_single_websocket_argument(self) -> None:
         signature = inspect.signature(ujaallc_hub.visualizer_endpoint_handler)

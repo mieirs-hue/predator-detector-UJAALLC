@@ -7,7 +7,7 @@ ZONE_TOPOLOGY = {
         "label": "Office",
         "color": "#00FF88",  # Green - Primary Active
         "baseline_rssi": -65,
-        "mount_height_ft": 9,
+        "mount_height_ft": 5,
         "vertical_reference": {
             "above": "ZONE_UPSTAIRS",
             "below": "ZONE_OFFICE"
@@ -19,7 +19,7 @@ ZONE_TOPOLOGY = {
         "label": "Garage",
         "color": "#3399FF",  # Blue - Equipment
         "baseline_rssi": -70,
-        "mount_height_ft": 6,
+        "mount_height_ft": 5,
         "vertical_reference": {
             "above": "NONE",
             "below": "ZONE_GARAGE"
@@ -28,10 +28,10 @@ ZONE_TOPOLOGY = {
     "FSS-N03": {
         "zone_id": "ZONE_SOUTH_BASELINE",
         "category": "Reference",
-        "label": "Bay Room",
+        "label": "Baby's Room",
         "color": "#A0A0A0",  # Gray - Baseline/Control
         "baseline_rssi": -85,
-        "mount_height_ft": 4,
+        "mount_height_ft": 5,
         "vertical_reference": {
             "above": "NONE",
             "below": "NONE"
@@ -40,10 +40,10 @@ ZONE_TOPOLOGY = {
     "FSS-N04": {
         "zone_id": "ZONE_WEST_ENTRY",
         "category": "Entry",
-        "label": "Front Entry",
+        "label": "Entryway",
         "color": "#FFD700",  # Gold - Entry Monitor
         "baseline_rssi": -60,
-        "mount_height_ft": 7,
+        "mount_height_ft": 5,
         "vertical_reference": {
             "above": "NONE",
             "below": "ZONE_ENTRY"

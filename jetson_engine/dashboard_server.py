@@ -198,6 +198,7 @@ HTML_PAGE = """
   <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
   <title>FSS Fleet Dashboard | Neon Matrix</title>
   <script src=\"https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js\"></script>
+  <script src=\"https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js\"></script>
   <style>
     :root { color-scheme: dark; --text:#e8ffe1; --muted:#89a38d; --neon:#39ff14; --cyan:#44d7ff; --amber:#ffd166; --shadow:0 0 0 1px rgba(57,255,20,.08),0 0 24px rgba(57,255,20,.12); --panel-border:rgba(57,255,20,.22); }
     html { font-size: 18px; }
@@ -236,6 +237,13 @@ HTML_PAGE = """
     th { color:var(--amber); font-size:.9rem; letter-spacing:.14em; text-transform:uppercase; }
     tbody tr:hover { background:rgba(57,255,20,.06); }
     pre { margin:0; white-space:pre-wrap; word-break:break-word; font-size:1rem; line-height:1.55; color:#d8ffe0; }
+    #nodeCardBar { display:flex; gap:12px; justify-content:center; padding:10px 18px 18px; flex-wrap:wrap; }
+    .node-card { background:rgba(18,26,38,.88); border:1px solid #1e2d42; border-top:3px solid #00f0ff; border-radius:6px; padding:10px 14px; min-width:140px; backdrop-filter:blur(8px); }
+    .card-id { font-weight:bold; font-size:1rem; color:#fff; letter-spacing:.08em; }
+    .card-zone { font-size:.75rem; text-transform:uppercase; color:#00f0ff; letter-spacing:.5px; margin-bottom:4px; }
+    .card-dist { font-size:1.1rem; color:var(--neon); font-variant-numeric:tabular-nums; margin-bottom:4px; }
+    .card-status { font-size:.74rem; color:#4cd964; display:flex; align-items:center; gap:5px; }
+    .dot { width:7px; height:7px; background:#4cd964; border-radius:50%; box-shadow:0 0 6px #4cd964; }
     @media (max-width: 1100px) { .dashboard-grid { grid-template-columns:1fr; } .control-panel { position:static; } }
     @media (max-width: 720px) { html { font-size: 16px; } .shell { padding:16px; } #canvas-container { height:300px; } }
   </style>
@@ -247,9 +255,8 @@ HTML_PAGE = """
       <div class=\"stack\">
         <div class=\"status\" id=\"status\">Connecting to edge hub…</div>
         <div class=\"scene\">
-          <div class=\"scene-header\"><h2>40×40 ft Engineering Floorplan</h2><div class=\"hint\">1 unit = 1 foot · 4 rooms × 20ft² · 9ft sensor height</div></div>
-          <div id=\"canvas-container\"></div>
-        </div>
+          <div class=\"scene-header\"><h2>40×40 ft Engineering Floorplan</h2><div class=\"hint\">1 unit = 1 foot · 4 rooms × 20ft² · 5ft sensor height · drag to orbit</div></div>
+          <div id=\"canvas-container\"></div>          <div id="nodeCardBar"></div>        </div>
         <div class=\"card\"><h3>Node Status</h3><table><thead><tr><th>Node</th><th>Motion</th><th>Signal</th><th>State</th><th>Last Update</th></tr></thead><tbody id=\"rows\"></tbody></table></div>
         <div class=\"card\"><h3>Latest packet</h3><pre id=\"latest\">Waiting for telemetry…</pre></div>
       </div>
@@ -267,16 +274,17 @@ HTML_PAGE = """
     const ROOM_DEPTH = 20;
     const WALL_HEIGHT = 9;
     const WALL_THICKNESS = 0.25;
-    const SENSOR_HEIGHT = 9;
+    const SENSOR_HEIGHT = 5; // 5-foot tripod mount
     
     const ROOMS = {
-      "FSS-N01": { id: "FSS-N01", name: "OFFICE", center: [-10, 0, -10], bounds: { minX: -20, maxX: 0, minZ: -20, maxZ: 0 } },
-      "FSS-N02": { id: "FSS-N02", name: "GARAGE", center: [10, 0, -10], bounds: { minX: 0, maxX: 20, minZ: -20, maxZ: 0 } },
-      "FSS-N03": { id: "FSS-N03", name: "ROOM 3", center: [-10, 0, 10], bounds: { minX: -20, maxX: 0, minZ: 0, maxZ: 20 } },
-      "FSS-N04": { id: "FSS-N04", name: "FRONT ENTRY", center: [10, 0, 10], bounds: { minX: 0, maxX: 20, minZ: 0, maxZ: 20 } }
+      "FSS-N01": { id: "FSS-N01", name: "OFFICE",      center: [-10, 0, -10], color: 0x00f0ff },
+      "FSS-N02": { id: "FSS-N02", name: "GARAGE",      center: [10, 0, -10],  color: 0xff9900 },
+      "FSS-N03": { id: "FSS-N03", name: "BABY'S ROOM", center: [-10, 0, 10],  color: 0xff0055 },
+      "FSS-N04": { id: "FSS-N04", name: "ENTRYWAY",    center: [10, 0, 10],   color: 0x7b00ff }
     };
     
     let scene, camera, renderer, orbitControls;
+    const animatedSpheres = [];
     
     function initThreeJS() {
       const container = document.getElementById('canvas-container');
@@ -285,20 +293,26 @@ HTML_PAGE = """
       
       scene = new THREE.Scene();
       scene.background = new THREE.Color(0x030605);
+      scene.fog = new THREE.FogExp2(0x0b0e14, 0.008);
       
-      camera = new THREE.PerspectiveCamera(75, width / height, 0.1, 1000);
+      camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
       camera.position.set(0, 38, 42);
       camera.lookAt(0, 0, 0);
       
-      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer = new THREE.WebGLRenderer({ antialias: true });
       renderer.setSize(width, height);
       renderer.setPixelRatio(window.devicePixelRatio);
       renderer.shadowMap.enabled = true;
       container.appendChild(renderer.domElement);
       
-      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
-      scene.add(ambientLight);
+      // Orbit controls — drag to rotate, scroll to zoom
+      orbitControls = new THREE.OrbitControls(camera, renderer.domElement);
+      orbitControls.enableDamping = true;
+      orbitControls.dampingFactor = 0.05;
+      orbitControls.maxPolarAngle = Math.PI / 2 - 0.05;
       
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
+      scene.add(ambientLight);
       const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
       directionalLight.position.set(20, 30, 20);
       directionalLight.castShadow = true;
@@ -306,92 +320,81 @@ HTML_PAGE = """
       
       // FLOOR
       const floorGeometry = new THREE.BoxGeometry(FLOOR_WIDTH, 0.15, FLOOR_DEPTH);
-      const floorMaterial = new THREE.MeshStandardMaterial({ color: 0x111827, roughness: 0.85, metalness: 0.05 });
+      const floorMaterial = new THREE.MeshStandardMaterial({ color: 0x0f1520, roughness: 0.85, metalness: 0.05 });
       const floor = new THREE.Mesh(floorGeometry, floorMaterial);
       floor.position.set(0, -0.075, 0);
-      floor.castShadow = true;
       floor.receiveShadow = true;
       scene.add(floor);
       
-      // ENGINEERING GRID
-      const engineeringGrid = new THREE.GridHelper(40, 40, 0x475569, 0x1e293b);
+      // ENGINEERING GRID (1-foot spacing)
+      const engineeringGrid = new THREE.GridHelper(40, 40, 0x1e2d42, 0x121a26);
       engineeringGrid.position.y = 0.01;
       scene.add(engineeringGrid);
       
-      // WALLS
-      const wallMaterial = new THREE.MeshStandardMaterial({ color: 0x64748b, transparent: true, opacity: 0.35, roughness: 0.8 });
+      // WALLS (wireframe style matching neon aesthetic)
+      const wallMaterial = new THREE.MeshBasicMaterial({ color: 0x1e3a5f, wireframe: true });
       
-      function createWall(width, depth, x, y, z) {
-        const geometry = new THREE.BoxGeometry(
-          width,
-          WALL_HEIGHT,
-          width === WALL_THICKNESS ? FLOOR_DEPTH : WALL_THICKNESS
-        );
-        const wall = new THREE.Mesh(geometry, wallMaterial);
+      function createWall(w, h, d, x, y, z) {
+        const geo = new THREE.BoxGeometry(w, h, d);
+        const wall = new THREE.Mesh(geo, wallMaterial);
         wall.position.set(x, y, z);
-        wall.castShadow = true;
-        wall.receiveShadow = true;
         scene.add(wall);
       }
       
-      // NORTH/SOUTH walls
-      createWall(FLOOR_WIDTH, WALL_HEIGHT, 0, WALL_HEIGHT / 2, -20);
-      createWall(FLOOR_WIDTH, WALL_HEIGHT, 0, WALL_HEIGHT / 2, 20);
+      createWall(FLOOR_WIDTH, WALL_HEIGHT, WALL_THICKNESS, 0, WALL_HEIGHT/2, -20); // NORTH
+      createWall(FLOOR_WIDTH, WALL_HEIGHT, WALL_THICKNESS, 0, WALL_HEIGHT/2,  20); // SOUTH
+      createWall(WALL_THICKNESS, WALL_HEIGHT, FLOOR_DEPTH, -20, WALL_HEIGHT/2, 0); // WEST
+      createWall(WALL_THICKNESS, WALL_HEIGHT, FLOOR_DEPTH,  20, WALL_HEIGHT/2, 0); // EAST
+      createWall(WALL_THICKNESS, WALL_HEIGHT, FLOOR_DEPTH,   0, WALL_HEIGHT/2, 0); // N/S divider
+      createWall(FLOOR_WIDTH, WALL_HEIGHT, WALL_THICKNESS,   0, WALL_HEIGHT/2, 0); // E/W divider
       
-      // EAST/WEST walls
-      createWall(WALL_THICKNESS, WALL_HEIGHT, -20, WALL_HEIGHT / 2, 0);
-      createWall(WALL_THICKNESS, WALL_HEIGHT, 20, WALL_HEIGHT / 2, 0);
-      
-      // INTERNAL walls
-      createWall(WALL_THICKNESS, WALL_HEIGHT, 0, WALL_HEIGHT / 2, 0);  // North/South divider
-      const horizontalWallGeometry = new THREE.BoxGeometry(FLOOR_WIDTH, WALL_HEIGHT, WALL_THICKNESS);
-      const horizontalWall = new THREE.Mesh(horizontalWallGeometry, wallMaterial);
-      horizontalWall.position.set(0, WALL_HEIGHT / 2, 0);
-      horizontalWall.castShadow = true;
-      horizontalWall.receiveShadow = true;
-      scene.add(horizontalWall);
-      
-      // SENSOR POSITIONS
+      // SENSOR NODES — board + pulsing monitoring sphere
       Object.values(ROOMS).forEach(room => {
-        const markerGeometry = new THREE.SphereGeometry(0.65, 24, 24);
-        const markerMaterial = new THREE.MeshStandardMaterial({ color: 0x38bdf8, emissive: 0x123b59 });
-        const marker = new THREE.Mesh(markerGeometry, markerMaterial);
-        marker.position.set(room.center[0], SENSOR_HEIGHT, room.center[2]);
-        marker.userData.nodeId = room.id;
-        marker.castShadow = true;
-        scene.add(marker);
-        room.sensorMesh = marker;
+        const nodeGroup = new THREE.Group();
+        nodeGroup.position.set(room.center[0], SENSOR_HEIGHT, room.center[2]);
+        
+        // PCB board
+        const boardGeo = new THREE.BoxGeometry(1.2, 0.2, 1.8);
+        const boardMat = new THREE.MeshStandardMaterial({ color: 0x004d25, metalness: 0.5 });
+        nodeGroup.add(new THREE.Mesh(boardGeo, boardMat));
+        
+        // Chip
+        const chipGeo = new THREE.BoxGeometry(0.6, 0.1, 0.6);
+        const chipMat = new THREE.MeshStandardMaterial({ color: 0xaaaaaa, metalness: 0.9 });
+        const chip = new THREE.Mesh(chipGeo, chipMat);
+        chip.position.y = 0.15;
+        nodeGroup.add(chip);
+        
+        // Monitoring sphere (pulsing)
+        const sphereGeo = new THREE.SphereGeometry(6, 32, 32);
+        const sphereMat = new THREE.MeshBasicMaterial({ color: room.color, transparent: true, opacity: 0.12, wireframe: true });
+        const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+        nodeGroup.add(sphere);
+        animatedSpheres.push({ mesh: sphere, offset: Math.random() * Math.PI * 2 });
+        
+        // Point light
+        const pointLight = new THREE.PointLight(room.color, 1.5, 18);
+        nodeGroup.add(pointLight);
+        
+        scene.add(nodeGroup);
+        room.sensorGroup = nodeGroup;
+        room.sphereMesh = sphere;
       });
       
-      // ROOM FLOOR CENTERS
-      Object.values(ROOMS).forEach(room => {
-        const geometry = new THREE.PlaneGeometry(ROOM_WIDTH - 0.5, ROOM_DEPTH - 0.5);
-        const material = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.025, side: THREE.DoubleSide });
-        const zone = new THREE.Mesh(geometry, material);
-        zone.rotation.x = -Math.PI / 2;
-        zone.position.set(room.center[0], 0.02, room.center[2]);
-        zone.userData.room = room.id;
-        scene.add(zone);
-        room.zoneMesh = zone;
-      });
-      
-      // DIMENSION ANNOTATIONS (using text sprites)
-      const canvas = document.createElement('canvas');
-      canvas.width = 256;
-      canvas.height = 256;
-      const ctx = canvas.getContext('2d');
+      // DIMENSION LABEL
+      const labelCanvas = document.createElement('canvas');
+      labelCanvas.width = 256; labelCanvas.height = 64;
+      const ctx = labelCanvas.getContext('2d');
       ctx.fillStyle = '#44d7ff';
-      ctx.font = 'bold 48px monospace';
+      ctx.font = 'bold 36px monospace';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      ctx.fillText('40 ft', 128, 128);
-      
-      const texture = new THREE.CanvasTexture(canvas);
-      const spriteMaterial = new THREE.SpriteMaterial({ map: texture, sizeAttenuation: true });
-      const sprite = new THREE.Sprite(spriteMaterial);
-      sprite.scale.set(8, 8, 1);
-      sprite.position.set(0, 22, -25);
-      scene.add(sprite);
+      ctx.fillText('← 40 ft →', 128, 32);
+      const labelTex = new THREE.CanvasTexture(labelCanvas);
+      const labelSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: labelTex }));
+      labelSprite.scale.set(12, 3, 1);
+      labelSprite.position.set(0, 12, -22);
+      scene.add(labelSprite);
       
       window.addEventListener('resize', onWindowResize);
       animate();
@@ -399,16 +402,46 @@ HTML_PAGE = """
     
     function onWindowResize() {
       const container = document.getElementById('canvas-container');
-      const width = container.clientWidth;
-      const height = container.clientHeight;
-      camera.aspect = width / height;
+      camera.aspect = container.clientWidth / container.clientHeight;
       camera.updateProjectionMatrix();
-      renderer.setSize(width, height);
+      renderer.setSize(container.clientWidth, container.clientHeight);
     }
     
+    let animTime = 0;
     function animate() {
       requestAnimationFrame(animate);
+      animTime += 0.03;
+      animatedSpheres.forEach((item) => {
+        const s = 1 + Math.sin(animTime + item.offset) * 0.07;
+        item.mesh.scale.set(s, s, s);
+        item.mesh.rotation.y += 0.003;
+      });
+      orbitControls.update();
       renderer.render(scene, camera);
+    }
+    
+    // ── Node status cards (bottom bar driven by live telemetry) ──────────────
+    function buildNodeCards() {
+      const bar = document.getElementById('nodeCardBar');
+      bar.innerHTML = '';
+      Object.values(ROOMS).forEach(room => {
+        const card = document.createElement('div');
+        card.className = 'node-card';
+        card.id = `card-${room.id}`;
+        card.innerHTML = `
+          <div class="card-id">${room.id}</div>
+          <div class="card-zone">${room.name}</div>
+          <div class="card-dist" id="dist-${room.id}">— cm</div>
+          <div class="card-status" id="dot-${room.id}"><span class="dot"></span> AWAITING</div>`;
+        bar.appendChild(card);
+      });
+    }
+    
+    function updateNodeCard(nodeId, packet) {
+      const distEl = document.getElementById(`dist-${nodeId}`);
+      const dotEl  = document.getElementById(`dot-${nodeId}`);
+      if (distEl) distEl.textContent = packet.distance_cm >= 0 ? `${packet.distance_cm} cm` : 'ERR';
+      if (dotEl)  dotEl.innerHTML = `<span class="dot"></span> ${packet.status || 'LIVE'}`;
     }
     
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -474,10 +507,15 @@ HTML_PAGE = """
       }
 
       latestEl.textContent = JSON.stringify(state.latest_packet || {}, null, 2);
+      // update node cards with live distance
+      if (state.latest_packet && state.latest_packet.node_id) {
+        updateNodeCard(state.latest_packet.node_id, state.latest_packet);
+      }
     }
 
     socket.onopen = () => { 
       controlStateEl.textContent = 'Connected to dashboard websocket';
+      buildNodeCards();
       initThreeJS();
     };
     socket.onmessage = (event) => {
