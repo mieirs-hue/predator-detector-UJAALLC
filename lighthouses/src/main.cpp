@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <ArduinoJson.h>
+#include <driver/i2s.h>
 
 #ifndef NODE_NAME
 #define NODE_NAME "FSS-N01"
@@ -9,6 +10,11 @@
 #define I2C_SDA_PIN   10
 #define I2C_SCL_PIN   11
 #define TF_LUNA_ADDR  0x10
+
+#define AMP_I2S_PORT  I2S_NUM_1
+#define AMP_BCLK_PIN  4
+#define AMP_LRC_PIN   5
+#define AMP_DIN_PIN   6
 
 #ifndef TF_LUNA_INT_PIN
 #define TF_LUNA_INT_PIN -1
@@ -33,6 +39,7 @@ uint8_t i2c_scan_last_addr = 0;
 bool i2c_scan_tf_luna_present = false;
 char i2c_scan_addrs[96] = "";
 bool tf_luna_int_enabled = false;
+bool audio_ready = false;
 
 void runI2CScan() {
     i2c_scan_count = 0;
@@ -76,6 +83,91 @@ int parseDistanceFrom9(const uint8_t* buf) {
     }
     // TF-Luna native I2C register-style payload fallback.
     return (int)((buf[1] << 8) | buf[0]);
+}
+
+void setupAudioOutput() {
+    i2s_config_t amp_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 256,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
+        .fixed_mclk = 0
+    };
+
+    i2s_pin_config_t amp_pins = {
+        .bck_io_num = AMP_BCLK_PIN,
+        .ws_io_num = AMP_LRC_PIN,
+        .data_out_num = AMP_DIN_PIN,
+        .data_in_num = I2S_PIN_NO_CHANGE
+    };
+
+    esp_err_t install_err = i2s_driver_install(AMP_I2S_PORT, &amp_config, 0, NULL);
+    if (install_err != ESP_OK) {
+        Serial.printf("[%s] Audio init failed (driver): %d\n", NODE_NAME, (int)install_err);
+        audio_ready = false;
+        return;
+    }
+
+    esp_err_t pin_err = i2s_set_pin(AMP_I2S_PORT, &amp_pins);
+    if (pin_err != ESP_OK) {
+        Serial.printf("[%s] Audio init failed (pins): %d\n", NODE_NAME, (int)pin_err);
+        i2s_driver_uninstall(AMP_I2S_PORT);
+        audio_ready = false;
+        return;
+    }
+
+    audio_ready = true;
+}
+
+void playTone(int frequency, int duration_ms, int amplitude = 2200) {
+    if (!audio_ready || frequency <= 0 || duration_ms <= 0) return;
+
+    const int sample_rate = 16000;
+    const int total_samples = (sample_rate * duration_ms) / 1000;
+    const int half_period = max(1, sample_rate / (frequency * 2));
+    size_t bytes_written = 0;
+
+    for (int i = 0; i < total_samples; i++) {
+        int16_t sample = ((i / half_period) % 2 == 0) ? amplitude : -amplitude;
+        int16_t frame[2] = { sample, sample };
+        i2s_write(AMP_I2S_PORT, frame, sizeof(frame), &bytes_written, portMAX_DELAY);
+    }
+}
+
+void handleAudioCommand(const String& command) {
+    if (command == "BEEP") {
+        playTone(800, 180, 2200);
+        return;
+    }
+
+    if (command == "SIREN") {
+        playTone(1200, 220, 2600);
+        playTone(700, 220, 2600);
+        return;
+    }
+}
+
+void checkSerialCommands() {
+    static String line;
+    while (Serial.available() > 0) {
+        char c = (char)Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (line.length() > 0) {
+                line.trim();
+                line.toUpperCase();
+                handleAudioCommand(line);
+                line = "";
+            }
+            continue;
+        }
+        line += c;
+    }
 }
 
 void IRAM_ATTR handleLidarInterrupt() {
@@ -174,10 +266,14 @@ void setup() {
         tf_luna_int_enabled = true;
     }
 
+    setupAudioOutput();
+
     Serial.printf("[%s] Ready.\n", NODE_NAME);
 }
 
 void loop() {
+    checkSerialCommands();
+
     unsigned long now = millis();
 
     // For the first 10s, repeatedly re-scan I2C at a controlled cadence.
@@ -214,6 +310,7 @@ void loop() {
     doc["i2c_scan_addrs"] = i2c_scan_addrs;
     doc["tf_luna_int_pin"] = TF_LUNA_INT_PIN;
     doc["tf_luna_int_enabled"] = tf_luna_int_enabled;
+    doc["audio_ready"] = audio_ready;
     doc["supply_note"]  = "TF-Luna needs >=4.5V";
 
     serializeJson(doc, Serial);
