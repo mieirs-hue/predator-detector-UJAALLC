@@ -51,6 +51,7 @@ def build_node_state(node_id: str) -> dict:
     "rssi": None,
     "strength": 0,
     "distance_cm": None,
+    "mic_rms": None,
     "sensor_status": "UNKNOWN",
     "sensor_ok": False,
     "last_seen": None,
@@ -137,6 +138,12 @@ def update_motion_state(node: dict, packet: dict) -> None:
   except (TypeError, ValueError):
     rssi_value = None
 
+  mic_rms = raw.get("mic_rms")
+  try:
+    mic_rms_value = float(mic_rms) if mic_rms is not None else None
+  except (TypeError, ValueError):
+    mic_rms_value = None
+
   motion_active = state.get("state") == "HOLD"
   motion_label = "CLEAR"
 
@@ -162,6 +169,11 @@ def update_motion_state(node: dict, packet: dict) -> None:
     if motion_active and motion_label == "CLEAR":
       motion_label = "CONFIRMING_TARGET"
 
+  # Voice-activity fallback path for firmware that publishes microphone RMS.
+  if not motion_active and mic_rms_value is not None and mic_rms_value >= 0.12:
+    motion_active = True
+    motion_label = "CONFIRMING_TARGET"
+
   if not motion_active and motion_label not in {"SENSOR_ERR", "UNKNOWN"}:
     motion_label = "CLEAR"
 
@@ -176,6 +188,7 @@ def update_motion_state(node: dict, packet: dict) -> None:
   node["rssi"] = rssi_value
   node["strength"] = state.get("strength", 0)
   node["distance_cm"] = distance_value
+  node["mic_rms"] = mic_rms_value
   node["sensor_status"] = sensor_status
   node["sensor_ok"] = sensor_ok
   node["last_seen"] = datetime.now().isoformat()
@@ -378,6 +391,7 @@ HTML_PAGE = """
     let threeInitialized = false;
     const animatedSpheres = [];
     const nodeSpheres = {};
+    const lastNodeVisualState = {};
     const speakerNodes = [
       { id: 'FSS-N01', zone: 'Office' },
       { id: 'FSS-N02', zone: 'Garage' },
@@ -423,6 +437,50 @@ HTML_PAGE = """
       gain.connect(ctx.destination);
       osc.start(now);
       osc.stop(now + duration);
+    }
+
+    async function playAlertBeep(frequency = 920, durationMs = 220) {
+      const ctx = getAudioContext();
+      if (!ctx) return;
+      if (ctx.state === 'suspended') {
+        try {
+          await ctx.resume();
+        } catch (error) {
+          return;
+        }
+      }
+
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const now = ctx.currentTime;
+      const duration = durationMs / 1000;
+
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(frequency, now);
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.16, now + 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + duration);
+    }
+
+    function triggerPhaseTracer(nodeId, mode = 'CONFIRMING_TARGET') {
+      const room = ROOMS[nodeId];
+      if (!room || !room.phaseBox) return;
+
+      const box = room.phaseBox;
+      const isPredator = mode === 'PREDATOR_DETECTED';
+      box.userData.mode = mode;
+      box.userData.alertUntil = Date.now() + 4200;
+
+      if (isPredator) {
+        box.scale.set(1.45, 1.9, 1.45);
+      } else {
+        box.scale.set(1.05, 1.05, 1.05);
+      }
     }
 
     function highlightNodeSphere(nodeId) {
@@ -589,6 +647,16 @@ HTML_PAGE = """
         room.sensorGroup = nodeGroup;
         room.sphereMesh = sphere;
         room.pointLight = pointLight;
+
+        // Phase-10 alert tracer box (pet/human-sized visual envelope).
+        const phaseBoxGeo = new THREE.BoxGeometry(2.4, 2.4, 2.4);
+        const phaseBoxMat = new THREE.MeshBasicMaterial({ color: 0xffb347, wireframe: true, transparent: true, opacity: 0.0 });
+        const phaseBox = new THREE.Mesh(phaseBoxGeo, phaseBoxMat);
+        phaseBox.position.set(0, 1.2, 0);
+        phaseBox.userData.alertUntil = 0;
+        phaseBox.userData.mode = 'CLEAR';
+        nodeGroup.add(phaseBox);
+        room.phaseBox = phaseBox;
       });
       
       // DIMENSION LABEL
@@ -628,6 +696,24 @@ HTML_PAGE = """
         item.mesh.scale.set(s, s, s);
         item.mesh.rotation.y += 0.003;
       });
+
+      const nowMs = Date.now();
+      Object.values(ROOMS).forEach((room) => {
+        if (!room.phaseBox) return;
+        const box = room.phaseBox;
+        const alertUntil = box.userData.alertUntil || 0;
+        const active = nowMs < alertUntil;
+        if (!active) {
+          box.material.opacity *= 0.85;
+          return;
+        }
+
+        const t = (alertUntil - nowMs) / 1000;
+        const blink = 0.35 + Math.abs(Math.sin(animTime * 4.3)) * 0.55;
+        box.material.opacity = Math.min(0.85, blink * (0.55 + Math.max(0, t) * 0.1));
+        box.material.color.setHex(box.userData.mode === 'PREDATOR_DETECTED' ? 0xff3b30 : 0xffb347);
+      });
+
       orbitControls.update();
       renderer.render(scene, camera);
     }
@@ -825,6 +911,18 @@ HTML_PAGE = """
       broadcastStateEl.textContent = state.hub?.status || 'No commands sent yet';
       ensureNodeControls(nodes);
       for (const node of nodes) {
+        const previousLabel = lastNodeVisualState[node.node_id] || 'CLEAR';
+        const enteredAlert = (
+          node.motion_label === 'CONFIRMING_TARGET' || node.motion_label === 'PREDATOR_DETECTED'
+        ) && previousLabel !== node.motion_label;
+
+        if (enteredAlert) {
+          triggerPhaseTracer(node.node_id, node.motion_label);
+          const alertHz = node.motion_label === 'PREDATOR_DETECTED' ? 1240 : 920;
+          playAlertBeep(alertHz, 220).catch(() => {});
+        }
+
+        lastNodeVisualState[node.node_id] = node.motion_label;
         updateNodeControl(node);
         updateNodeRow(node);
         updateRoomVisual(node);

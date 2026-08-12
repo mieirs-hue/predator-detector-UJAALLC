@@ -113,7 +113,10 @@ async def serial_endpoint_handler(port_path: str, node_name: str) -> None:
             except json.JSONDecodeError:
                 continue
 
-            resolved_name = packet.get("node_id") or node_name
+            # Canonical zone identity comes from the mapped serial port.
+            # This keeps room mapping stable even if a board was flashed with the wrong NODE_NAME.
+            reported_node_id = packet.get("node_id")
+            resolved_name = node_name
             rssi = float(packet.get("rssi", -99))
             filtered = process_zone_hysteresis(resolved_name, resolved_name, rssi)
 
@@ -121,6 +124,7 @@ async def serial_endpoint_handler(port_path: str, node_name: str) -> None:
                 "type": "PERIMETER_TELEMETRY",
                 "zone_data": {
                     "lighthouse": resolved_name,
+                    "reported_node_id": reported_node_id,
                     "raw_telemetry": packet,
                     "state": filtered,
                 },
