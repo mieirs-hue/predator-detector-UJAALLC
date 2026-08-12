@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from typing import Any, Dict, List, Set
 
@@ -11,7 +12,6 @@ from fastapi.responses import HTMLResponse
 
 from .config import ZONE_TOPOLOGY
 
-app = FastAPI(title="FSS Fleet Dashboard", version="0.1.0")
 HUB_WS_URL = os.getenv("UJAALLC_HUB_URL", "ws://127.0.0.1:8765")
 NODE_ORDER = ["FSS-N01", "FSS-N02", "FSS-N03", "FSS-N04"]
 LIGHTHOUSE_TO_NODE = {
@@ -20,6 +20,21 @@ LIGHTHOUSE_TO_NODE = {
   "FSS-N03": "FSS-N03",
   "FSS-N04": "FSS-N04",
 }
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+  # Keep hub relay alive while the dashboard API is running.
+  relay_task = asyncio.create_task(connect_to_hub())
+  try:
+    yield
+  finally:
+    relay_task.cancel()
+    with suppress(asyncio.CancelledError):
+      await relay_task
+
+
+app = FastAPI(title="FSS Fleet Dashboard", version="0.1.0", lifespan=lifespan)
 
 
 def build_node_state(node_id: str) -> dict:
@@ -948,6 +963,3 @@ async def connect_to_hub() -> None:
         await asyncio.sleep(10)
 
 
-@app.on_event("startup")
-async def startup_event() -> None:
-    asyncio.create_task(connect_to_hub())
