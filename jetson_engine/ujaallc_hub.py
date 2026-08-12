@@ -30,6 +30,33 @@ active_locks: Dict[str, dict] = {}
 visualizer_clients: Set[object] = set()
 
 
+async def handle_websocket_message(websocket, message: str) -> None:
+    try:
+        data = json.loads(message)
+    except json.JSONDecodeError:
+        return
+
+    if data.get("event") != "speaker_test":
+        return
+
+    node_id = data.get("node_id", "unknown")
+    zone = data.get("zone", "unknown")
+    duration_ms = data.get("duration_ms", 500)
+    start_hz = data.get("sweep_start_hz", 400)
+    end_hz = data.get("sweep_end_hz", 1400)
+    logging.info(
+        "[AUDIO TEST] %s (%s) %sms sweep %sHz->%sHz",
+        node_id,
+        zone,
+        duration_ms,
+        start_hz,
+        end_hz,
+    )
+
+    # Placeholder for downstream physical trigger routing, for example serial write to target node.
+    # await route_speaker_test_to_node(node_id, duration_ms, start_hz, end_hz)
+
+
 def process_zone_hysteresis(zone_id: str, mac_address: str, rssi_sample: float) -> dict:
     if mac_address not in active_locks:
         active_locks[mac_address] = {
@@ -122,7 +149,11 @@ async def visualizer_endpoint_handler(websocket) -> None:
         }
         await websocket.send(json.dumps(initial_payload))
         while True:
-            await asyncio.sleep(1)
+            try:
+                raw_message = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            await handle_websocket_message(websocket, raw_message)
     except websockets.ConnectionClosed:
         pass
     finally:

@@ -163,6 +163,16 @@ def toggle_node_feature(node_id: str, feature: str, enabled: bool | None = None)
   return node
 
 
+async def send_hub_command(payload: dict) -> bool:
+  try:
+    async with websockets.connect(HUB_WS_URL) as websocket:
+      await websocket.send(json.dumps(payload))
+    return True
+  except Exception as exc:
+    logging.debug("[dashboard] failed to send hub command: %s", exc)
+    return False
+
+
 class ConnectionManager:
     def __init__(self) -> None:
         self.active_connections: List[WebSocket] = []
@@ -220,6 +230,11 @@ HTML_PAGE = """
     .status { display:inline-flex; align-items:center; gap:.6rem; color:var(--neon); font-size:1.05rem; letter-spacing:.08em; text-transform:uppercase; margin-bottom:20px; }
     .status::before { content:"●"; color:var(--cyan); text-shadow:0 0 10px var(--cyan); }
     .control-panel { position:sticky; top:18px; display:grid; gap:18px; }
+    .speaker-control-panel { border:1px solid rgba(68,215,255,.30); border-radius:14px; background:rgba(6,18,26,.88); padding:14px; }
+    .speaker-control-title { font-weight:bold; margin-bottom:8px; color:var(--cyan); letter-spacing:.12em; text-transform:uppercase; font-size:.9rem; }
+    .speaker-test-button { width:100%; border:1px solid rgba(68,215,255,.55); background:linear-gradient(180deg, rgba(68,215,255,.92), rgba(30,180,220,.92)); color:#031014; border-radius:10px; padding:10px 12px; font-family:inherit; font-weight:bold; cursor:pointer; letter-spacing:.08em; text-transform:uppercase; }
+    .speaker-test-button:active { transform:translateY(1px); }
+    .speaker-status { margin-top:8px; font-size:.78rem; color:var(--muted); text-align:center; min-height:1.2em; }
     .status-card, .card, .node-control { padding:16px; }
     .status-card h3, .card h3 { color:var(--cyan); font-size:1rem; }
     .status-card p { margin:10px 0 0; line-height:1.45; font-size:.95rem; }
@@ -262,6 +277,11 @@ HTML_PAGE = """
       </div>
       <div class=\"control-panel\">
         <div class=\"status-card\"><h3>System Controls</h3><p>Speakers start silenced. Each FSS node has independent intercom and siren toggles, and the dashboard will stay lightweight by using live telemetry from the ESP32 side instead of doing heavy processing on the Jetson.</p></div>
+        <div class=\"speaker-control-panel\">
+          <div class=\"speaker-control-title\">Acoustic Subsystem</div>
+          <button id=\"btn-siren-test\" class=\"speaker-test-button\" type=\"button\">Cycle Speaker Check (0.5s)</button>
+          <div id=\"speaker-status\" class=\"speaker-status\">Ready to test (click to cycle nodes)</div>
+        </div>
         <div class=\"card\"><h3>Command State</h3><div class=\"control-readout\"><strong>Dashboard</strong><span id=\"controlState\">Idle</span></div><div class=\"control-readout\"><strong>Broadcast</strong><span id=\"broadcastState\">No commands sent yet</span></div></div>
         <div class=\"control-grid\" id=\"controlPanel\"></div>
       </div>
@@ -285,6 +305,88 @@ HTML_PAGE = """
     
     let scene, camera, renderer, orbitControls;
     const animatedSpheres = [];
+    const nodeSpheres = {};
+    const speakerNodes = [
+      { id: 'FSS-N01', zone: 'Office' },
+      { id: 'FSS-N02', zone: 'Garage' },
+      { id: 'FSS-N03', zone: "Baby\'s Room" },
+      { id: 'FSS-N04', zone: 'Entryway' },
+    ];
+    let currentSpeakerIndex = 0;
+    let audioContext = null;
+
+    function getAudioContext() {
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return null;
+      if (!audioContext) audioContext = new AudioCtx();
+      return audioContext;
+    }
+
+    async function playWebSirenTone(durationMs = 500) {
+      const ctx = getAudioContext();
+      if (!ctx) return;
+      if (ctx.state === 'suspended') {
+        try {
+          await ctx.resume();
+        } catch (error) {
+          return;
+        }
+      }
+
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      const now = ctx.currentTime;
+      const duration = durationMs / 1000;
+
+      osc.type = 'sawtooth';
+      osc.frequency.setValueAtTime(400, now);
+      osc.frequency.exponentialRampToValueAtTime(1400, now + duration * 0.5);
+      osc.frequency.exponentialRampToValueAtTime(400, now + duration);
+
+      gain.gain.setValueAtTime(0.001, now);
+      gain.gain.linearRampToValueAtTime(0.25, now + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now);
+      osc.stop(now + duration);
+    }
+
+    function highlightNodeSphere(nodeId) {
+      const sphere = nodeSpheres[nodeId];
+      if (!sphere) return;
+
+      const originalScale = sphere.userData.baseScale || 1;
+      sphere.scale.set(originalScale * 1.35, originalScale * 1.35, originalScale * 1.35);
+      setTimeout(() => {
+        sphere.scale.set(originalScale, originalScale, originalScale);
+      }, 500);
+    }
+
+    async function cycleSpeakerTest() {
+      const targetNode = speakerNodes[currentSpeakerIndex];
+      const statusElem = document.getElementById('speaker-status');
+
+      await playWebSirenTone(500);
+      highlightNodeSphere(targetNode.id);
+
+      if (statusElem) {
+        statusElem.innerHTML = `TESTING: <b style="color:#44d7ff">${targetNode.id}</b> (${targetNode.zone})`;
+      }
+
+      socket.send(JSON.stringify({
+        type: 'speaker_test',
+        event: 'speaker_test',
+        nodeId: targetNode.id,
+        zone: targetNode.zone,
+        durationMs: 500,
+        sweepStartHz: 400,
+        sweepEndHz: 1400,
+      }));
+
+      currentSpeakerIndex = (currentSpeakerIndex + 1) % speakerNodes.length;
+    }
     
     function initThreeJS() {
       const container = document.getElementById('canvas-container');
@@ -369,8 +471,10 @@ HTML_PAGE = """
         const sphereGeo = new THREE.SphereGeometry(6, 32, 32);
         const sphereMat = new THREE.MeshBasicMaterial({ color: room.color, transparent: true, opacity: 0.12, wireframe: true });
         const sphere = new THREE.Mesh(sphereGeo, sphereMat);
+        sphere.userData.baseScale = 1;
         nodeGroup.add(sphere);
         animatedSpheres.push({ mesh: sphere, offset: Math.random() * Math.PI * 2 });
+        nodeSpheres[room.id] = sphere;
         
         // Point light
         const pointLight = new THREE.PointLight(room.color, 1.5, 18);
@@ -452,6 +556,18 @@ HTML_PAGE = """
     const controlPanelEl = document.getElementById('controlPanel');
     const controlStateEl = document.getElementById('controlState');
     const broadcastStateEl = document.getElementById('broadcastState');
+    const sirenTestButton = document.getElementById('btn-siren-test');
+
+    if (sirenTestButton) {
+      sirenTestButton.addEventListener('click', () => {
+        cycleSpeakerTest().catch(() => {
+          const statusElem = document.getElementById('speaker-status');
+          if (statusElem) {
+            statusElem.textContent = 'Audio context unavailable or command failed';
+          }
+        });
+      });
+    }
 
     function formatAgo(timestamp) {
       if (!timestamp) return 'no signal';
@@ -568,8 +684,33 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             except json.JSONDecodeError:
                 continue
 
-            if message.get("type") != "control_command":
-                continue
+            command_type = message.get("type")
+            if command_type == "speaker_test":
+              command_payload = {
+                "event": "speaker_test",
+                "node_id": message.get("nodeId"),
+                "zone": message.get("zone"),
+                "duration_ms": int(message.get("durationMs", 500)),
+                "sweep_start_hz": int(message.get("sweepStartHz", 400)),
+                "sweep_end_hz": int(message.get("sweepEndHz", 1400)),
+                "issued_at": datetime.now().isoformat(),
+              }
+              ok = await send_hub_command(command_payload)
+              if ok:
+                await websocket.send_text(json.dumps({
+                  "type": "control_ack",
+                  "message": f"Speaker test dispatched to {command_payload['node_id']}",
+                }))
+                await broadcast_state(f"Speaker test on {command_payload['node_id']}")
+              else:
+                await websocket.send_text(json.dumps({
+                  "type": "control_ack",
+                  "message": "Speaker test failed to reach hub",
+                }))
+              continue
+
+            if command_type != "control_command":
+              continue
 
             node_id = message.get("nodeId")
             feature = message.get("feature")
