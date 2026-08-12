@@ -111,7 +111,8 @@ def update_motion_state(node: dict, packet: dict) -> None:
     distance_value = None
 
   sensor_status = str(raw.get("status", "UNKNOWN")).upper()
-  sensor_ok = sensor_status == "OK" and distance_value is not None and distance_value >= 0
+  has_valid_distance = distance_value is not None and distance_value >= 0
+  sensor_ok = sensor_status != "SENSOR_ERR" and has_valid_distance
 
   rssi = state.get("rssi")
   if rssi is None:
@@ -122,17 +123,41 @@ def update_motion_state(node: dict, packet: dict) -> None:
     rssi_value = None
 
   motion_active = state.get("state") == "HOLD"
+  motion_label = "CLEAR"
 
-  # Primary target confirmation path: valid TF-Luna distance in a near-field envelope.
-  if sensor_ok:
-    motion_active = distance_value <= 300
+  # Primary confirmation path from TF-Luna distance.
+  # 20ft sphere is approximately 610cm.
+  if has_valid_distance:
+    if distance_value <= 150:
+      motion_label = "PREDATOR_DETECTED"
+      motion_active = True
+    elif distance_value <= 610:
+      motion_label = "CONFIRMING_TARGET"
+      motion_active = True
+
+  # Respect firmware-provided labels when present.
+  if sensor_status in {"PREDATOR_DETECTED", "CONFIRMING_TARGET"}:
+    motion_label = sensor_status
+    motion_active = True
+  elif sensor_status == "SENSOR_ERR" and not motion_active:
+    motion_label = "SENSOR_ERR"
 
   if not motion_active and rssi_value is not None:
     motion_active = rssi_value >= float(node["baseline_rssi"]) + 5.0
+    if motion_active and motion_label == "CLEAR":
+      motion_label = "CONFIRMING_TARGET"
+
+  if not motion_active and motion_label not in {"SENSOR_ERR", "UNKNOWN"}:
+    motion_label = "CLEAR"
 
   node["motion"] = motion_active
-  node["motion_label"] = "MOTION" if motion_active else "CLEAR"
-  node["motion_intensity"] = "high" if motion_active else "idle"
+  node["motion_label"] = motion_label
+  node["motion_intensity"] = (
+    "high" if motion_label == "PREDATOR_DETECTED"
+    else "medium" if motion_label == "CONFIRMING_TARGET"
+    else "error" if motion_label == "SENSOR_ERR"
+    else "idle"
+  )
   node["rssi"] = rssi_value
   node["strength"] = state.get("strength", 0)
   node["distance_cm"] = distance_value
@@ -231,72 +256,83 @@ HTML_PAGE = """
   <script src=\"https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js\"></script>
   <style>
     :root { color-scheme: dark; --text:#e8ffe1; --muted:#89a38d; --neon:#39ff14; --cyan:#44d7ff; --amber:#ffd166; --shadow:0 0 0 1px rgba(57,255,20,.08),0 0 24px rgba(57,255,20,.12); --panel-border:rgba(57,255,20,.22); }
-    html { font-size: 18px; }
-    body { margin:0; min-height:100vh; font-family:"Consolas","Courier New",monospace; color:var(--text); background: radial-gradient(circle at top, rgba(57,255,20,.10), transparent 32%), radial-gradient(circle at bottom right, rgba(68,215,255,.08), transparent 28%), linear-gradient(180deg,#04070b 0%,#07110d 100%); }
+    html { font-size: 16px; }
+    body { margin:0; min-height:100vh; overflow:hidden; font-family:"Consolas","Courier New",monospace; color:var(--text); background: radial-gradient(circle at top, rgba(57,255,20,.10), transparent 32%), radial-gradient(circle at bottom right, rgba(68,215,255,.08), transparent 28%), linear-gradient(180deg,#04070b 0%,#07110d 100%); }
     body::before { content:""; position:fixed; inset:0; pointer-events:none; background-image: linear-gradient(rgba(57,255,20,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(57,255,20,.05) 1px, transparent 1px); background-size: 100% 42px, 42px 100%; opacity:.32; }
-    .shell { position:relative; max-width:1600px; margin:0 auto; padding:28px; }
-    .masthead { display:flex; flex-wrap:wrap; gap:12px; justify-content:space-between; align-items:baseline; margin-bottom:20px; }
-    h1 { margin:0; font-size:clamp(2.2rem,5vw,4rem); letter-spacing:.12em; text-transform:uppercase; text-shadow:0 0 12px rgba(57,255,20,.6); }
-    .subtitle { color:var(--muted); font-size:1rem; letter-spacing:.18em; text-transform:uppercase; }
-    .dashboard-grid { display:grid; grid-template-columns:minmax(0,2.1fr) minmax(340px,.9fr); gap:18px; align-items:start; }
-    .stack { display:grid; gap:18px; }
+    .shell { position:relative; max-width:1600px; height:100vh; margin:0 auto; padding:10px 14px 12px; box-sizing:border-box; display:flex; flex-direction:column; }
+    .masthead { display:flex; flex-wrap:wrap; gap:8px; justify-content:space-between; align-items:baseline; margin-bottom:8px; }
+    h1 { margin:0; font-size:clamp(1.2rem,2.4vw,2rem); letter-spacing:.10em; text-transform:uppercase; text-shadow:0 0 10px rgba(57,255,20,.45); }
+    .subtitle { color:var(--muted); font-size:.78rem; letter-spacing:.14em; text-transform:uppercase; }
+    .dashboard-grid { display:grid; flex:1; min-height:0; grid-template-columns:minmax(0,70%) minmax(280px,30%); gap:10px; align-items:stretch; }
+    .stack { display:grid; min-height:0; grid-template-rows:auto minmax(0,70%) minmax(0,30%); gap:10px; }
     .scene, .card, .status-card, .node-control { border:1px solid var(--panel-border); border-radius:18px; box-shadow:var(--shadow); background:linear-gradient(180deg, rgba(10,18,14,.96), rgba(6,10,8,.96)); backdrop-filter:blur(10px); }
-    .scene { position:relative; min-height:520px; overflow:hidden; background: radial-gradient(circle at top, rgba(57,255,20,.10), transparent 34%), linear-gradient(180deg, rgba(8,14,11,.98), rgba(3,6,5,.98)); }
-    .scene-header { display:flex; justify-content:space-between; gap:12px; padding:20px 20px 12px; }
+    .scene { position:relative; min-height:0; overflow:hidden; background: radial-gradient(circle at top, rgba(57,255,20,.10), transparent 34%), linear-gradient(180deg, rgba(8,14,11,.98), rgba(3,6,5,.98)); }
+    .scene-header { display:flex; justify-content:space-between; gap:8px; padding:10px 12px 8px; }
     .scene-header h2, .card h3, .status-card h3, .node-control h4 { margin:0; text-transform:uppercase; letter-spacing:.12em; }
-    .scene-header h2 { font-size:1.2rem; color:var(--cyan); }
+    .scene-header h2 { font-size:.9rem; color:var(--cyan); }
     .scene-header .hint, .status-card p, .node-meta, .control-button small { color:var(--muted); }
-    #canvas-container { width:100%; height:440px; }
-    .status { display:inline-flex; align-items:center; gap:.6rem; color:var(--neon); font-size:1.05rem; letter-spacing:.08em; text-transform:uppercase; margin-bottom:20px; }
+    #canvas-container { width:100%; height:calc(100% - 66px); }
+    .status { display:inline-flex; align-items:center; gap:.5rem; color:var(--neon); font-size:.85rem; letter-spacing:.06em; text-transform:uppercase; margin-bottom:0; }
     .status::before { content:"●"; color:var(--cyan); text-shadow:0 0 10px var(--cyan); }
-    .control-panel { position:sticky; top:18px; display:grid; gap:18px; }
-    .speaker-control-panel { border:1px solid rgba(68,215,255,.30); border-radius:14px; background:rgba(6,18,26,.88); padding:14px; }
-    .speaker-control-title { font-weight:bold; margin-bottom:8px; color:var(--cyan); letter-spacing:.12em; text-transform:uppercase; font-size:.9rem; }
-    .speaker-test-button { width:100%; border:1px solid rgba(68,215,255,.55); background:linear-gradient(180deg, rgba(68,215,255,.92), rgba(30,180,220,.92)); color:#031014; border-radius:10px; padding:10px 12px; font-family:inherit; font-weight:bold; cursor:pointer; letter-spacing:.08em; text-transform:uppercase; }
+    .control-panel { display:grid; align-content:start; gap:8px; min-height:0; overflow:auto; padding-right:2px; }
+    .speaker-control-panel { border:1px solid rgba(68,215,255,.30); border-radius:10px; background:rgba(6,18,26,.88); padding:8px; }
+    .speaker-control-title { font-weight:bold; margin-bottom:6px; color:var(--cyan); letter-spacing:.10em; text-transform:uppercase; font-size:.74rem; }
+    .speaker-test-button { width:100%; border:1px solid rgba(68,215,255,.55); background:linear-gradient(180deg, rgba(68,215,255,.92), rgba(30,180,220,.92)); color:#031014; border-radius:8px; padding:7px 8px; font-family:inherit; font-weight:bold; cursor:pointer; letter-spacing:.06em; text-transform:uppercase; font-size:.72rem; }
     .speaker-test-button:active { transform:translateY(1px); }
-    .speaker-status { margin-top:8px; font-size:.78rem; color:var(--muted); text-align:center; min-height:1.2em; }
-    .status-card, .card, .node-control { padding:16px; }
-    .status-card h3, .card h3 { color:var(--cyan); font-size:1rem; }
-    .status-card p { margin:10px 0 0; line-height:1.45; font-size:.95rem; }
-    .control-readout { display:grid; gap:8px; margin-bottom:14px; padding:14px; border-radius:14px; border:1px solid rgba(68,215,255,.18); background:rgba(8,14,11,.74); }
-    .control-readout strong { color:var(--amber); letter-spacing:.12em; text-transform:uppercase; font-size:.9rem; }
-    .control-grid { display:grid; gap:12px; }
+    .speaker-status { margin-top:5px; font-size:.68rem; color:var(--muted); text-align:center; min-height:1em; }
+    .status-card, .card, .node-control { padding:8px; }
+    .status-card h3, .card h3 { color:var(--cyan); font-size:.74rem; }
+    .status-card p { margin:3px 0 0; line-height:1.25; font-size:.66rem; }
+    .control-readout { display:grid; gap:3px; margin-bottom:6px; padding:7px; border-radius:9px; border:1px solid rgba(68,215,255,.18); background:rgba(8,14,11,.74); }
+    .control-readout strong { color:var(--amber); letter-spacing:.08em; text-transform:uppercase; font-size:.66rem; }
+    .control-grid { display:grid; gap:6px; }
     .node-control { background:rgba(8,14,11,.80); }
-    .node-meta { display:flex; flex-wrap:wrap; gap:8px; align-items:center; font-size:.88rem; margin:8px 0 12px; }
-    .node-pill { padding:4px 8px; border-radius:999px; border:1px solid rgba(68,215,255,.24); color:var(--cyan); text-transform:uppercase; letter-spacing:.12em; font-size:.74rem; }
-    .control-button { appearance:none; width:100%; border:1px solid rgba(57,255,20,.28); background:linear-gradient(180deg, rgba(18,31,22,.96), rgba(8,12,10,.98)); color:var(--text); border-radius:14px; padding:14px 16px; font-family:inherit; font-size:1rem; letter-spacing:.10em; text-transform:uppercase; text-align:left; cursor:pointer; }
+    .node-meta { display:flex; flex-wrap:wrap; gap:6px; align-items:center; font-size:.70rem; margin:6px 0 6px; }
+    .node-pill { padding:2px 6px; border-radius:999px; border:1px solid rgba(68,215,255,.24); color:var(--cyan); text-transform:uppercase; letter-spacing:.08em; font-size:.62rem; }
+    .control-button { appearance:none; width:100%; border:1px solid rgba(57,255,20,.28); background:linear-gradient(180deg, rgba(18,31,22,.96), rgba(8,12,10,.98)); color:var(--text); border-radius:10px; padding:8px 9px; font-family:inherit; font-size:.73rem; letter-spacing:.06em; text-transform:uppercase; text-align:left; cursor:pointer; }
     .control-button[data-active="true"] { border-color:rgba(57,255,20,.85); background:linear-gradient(180deg, rgba(57,255,20,.18), rgba(8,12,10,.98)); box-shadow:0 0 0 1px rgba(57,255,20,.20), 0 0 22px rgba(57,255,20,.16); }
     .card { margin-bottom:0; }
-    table { width:100%; border-collapse:collapse; font-size:1.02rem; }
-    th, td { text-align:left; padding:12px 10px; border-bottom:1px solid rgba(57,255,20,.14); }
-    th { color:var(--amber); font-size:.9rem; letter-spacing:.14em; text-transform:uppercase; }
+    table { width:100%; border-collapse:collapse; font-size:.78rem; }
+    th, td { text-align:left; padding:6px 6px; border-bottom:1px solid rgba(57,255,20,.14); }
+    th { color:var(--amber); font-size:.64rem; letter-spacing:.10em; text-transform:uppercase; }
     tbody tr:hover { background:rgba(57,255,20,.06); }
-    pre { margin:0; white-space:pre-wrap; word-break:break-word; font-size:1rem; line-height:1.55; color:#d8ffe0; }
-    #nodeCardBar { display:flex; gap:12px; justify-content:center; padding:10px 18px 18px; flex-wrap:wrap; }
-    .node-card { background:rgba(18,26,38,.88); border:1px solid #1e2d42; border-top:3px solid #00f0ff; border-radius:6px; padding:10px 14px; min-width:140px; backdrop-filter:blur(8px); }
-    .card-id { font-weight:bold; font-size:1rem; color:#fff; letter-spacing:.08em; }
-    .card-zone { font-size:.75rem; text-transform:uppercase; color:#00f0ff; letter-spacing:.5px; margin-bottom:4px; }
-    .card-dist { font-size:1.1rem; color:var(--neon); font-variant-numeric:tabular-nums; margin-bottom:4px; }
-    .card-status { font-size:.74rem; color:#4cd964; display:flex; align-items:center; gap:5px; }
+    pre { margin:0; white-space:pre-wrap; word-break:break-word; font-size:.70rem; line-height:1.28; color:#d8ffe0; max-height:110px; overflow:auto; }
+    #nodeCardBar { display:flex; gap:6px; justify-content:center; padding:6px 6px 10px; flex-wrap:wrap; }
+    .node-card { background:rgba(18,26,38,.88); border:1px solid #1e2d42; border-top:2px solid #00f0ff; border-radius:6px; padding:5px 7px; min-width:98px; backdrop-filter:blur(8px); }
+    .card-id { font-weight:bold; font-size:.68rem; color:#fff; letter-spacing:.05em; }
+    .card-zone { font-size:.57rem; text-transform:uppercase; color:#00f0ff; letter-spacing:.3px; margin-bottom:2px; }
+    .card-dist { font-size:.78rem; color:var(--neon); font-variant-numeric:tabular-nums; margin-bottom:2px; }
+    .card-status { font-size:.56rem; color:#4cd964; display:flex; align-items:center; gap:5px; }
     .dot { width:7px; height:7px; background:#4cd964; border-radius:50%; box-shadow:0 0 6px #4cd964; }
-    @media (max-width: 1100px) { .dashboard-grid { grid-template-columns:1fr; } .control-panel { position:static; } }
-    @media (max-width: 720px) { html { font-size: 16px; } .shell { padding:16px; } #canvas-container { height:300px; } }
+    .telemetry-grid { min-height:0; display:grid; grid-template-columns:minmax(0,1.4fr) minmax(0,.9fr); gap:8px; }
+    .telemetry-grid .card { min-height:0; overflow:auto; }
+    @media (max-width: 1100px) {
+      body { overflow:auto; }
+      .shell { height:auto; min-height:100vh; }
+      .dashboard-grid { grid-template-columns:1fr; }
+      .stack { grid-template-rows:auto minmax(420px,70vh) auto; }
+      .control-panel { overflow:visible; }
+      .telemetry-grid { grid-template-columns:1fr; }
+    }
+    @media (max-width: 720px) { html { font-size: 15px; } .shell { padding:10px; } }
   </style>
 </head>
 <body>
   <div class=\"shell\">
-    <div class=\"masthead\"><h1>FSS Fleet Dashboard</h1><div class=\"subtitle\">Neon matrix control view</div></div>
+    <div class=\"masthead\"><h1>FSS Fleet Dashboard</h1><div class=\"subtitle\">Visual Priority Mode</div></div>
     <div class=\"dashboard-grid\">
       <div class=\"stack\">
         <div class=\"status\" id=\"status\">Connecting to edge hub…</div>
         <div class=\"scene\">
-          <div class=\"scene-header\"><h2>40×40 ft Engineering Floorplan</h2><div class=\"hint\">1 unit = 1 foot · 4 rooms × 20ft² · 5ft sensor height · drag to orbit</div></div>
+          <div class=\"scene-header\"><h2>40×40 ft Engineering Floorplan</h2><div class=\"hint\">1 unit = 1 foot · 20ft confirm radius · active zone auto-expands</div></div>
           <div id=\"canvas-container\"></div>          <div id="nodeCardBar"></div>        </div>
-        <div class=\"card\"><h3>Node Status</h3><table><thead><tr><th>Node</th><th>Motion</th><th>Signal</th><th>State</th><th>Last Update</th></tr></thead><tbody id=\"rows\"></tbody></table></div>
-        <div class=\"card\"><h3>Latest packet</h3><pre id=\"latest\">Waiting for telemetry…</pre></div>
+        <div class=\"telemetry-grid\">
+          <div class=\"card\"><h3>Node Status</h3><table><thead><tr><th>Node</th><th>Motion</th><th>Signal</th><th>State</th><th>Last</th></tr></thead><tbody id=\"rows\"></tbody></table></div>
+          <div class=\"card\"><h3>Latest Packet</h3><pre id=\"latest\">Waiting for telemetry…</pre></div>
+        </div>
       </div>
       <div class=\"control-panel\">
-        <div class=\"status-card\"><h3>System Controls</h3><p>Speakers start silenced. Each FSS node has independent intercom and siren toggles, and the dashboard will stay lightweight by using live telemetry from the ESP32 side instead of doing heavy processing on the Jetson.</p></div>
+        <div class=\"status-card\"><h3>* System Controls</h3><p>* Compact mode enabled. Confirming-target uses TF-Luna distance first and RSSI fallback when sensors are degraded.</p></div>
         <div class=\"speaker-control-panel\">
           <div class=\"speaker-control-title\">Acoustic Subsystem</div>
           <button id=\"btn-siren-test\" class=\"speaker-test-button\" type=\"button\">Cycle Speaker Check (0.5s)</button>
@@ -377,12 +413,7 @@ HTML_PAGE = """
     function highlightNodeSphere(nodeId) {
       const sphere = nodeSpheres[nodeId];
       if (!sphere) return;
-
-      const originalScale = sphere.userData.baseScale || 1;
-      sphere.scale.set(originalScale * 1.35, originalScale * 1.35, originalScale * 1.35);
-      setTimeout(() => {
-        sphere.scale.set(originalScale, originalScale, originalScale);
-      }, 500);
+      sphere.userData.highlightUntil = Date.now() + 520;
     }
 
     function isSocketOpen() {
@@ -576,7 +607,9 @@ HTML_PAGE = """
       requestAnimationFrame(animate);
       animTime += 0.03;
       animatedSpheres.forEach((item) => {
-        const s = 1 + Math.sin(animTime + item.offset) * 0.07;
+        const dynamicScale = item.mesh.userData.dynamicScale || 1;
+        const boost = item.mesh.userData.highlightUntil && Date.now() < item.mesh.userData.highlightUntil ? 1.2 : 1;
+        const s = dynamicScale * boost * (1 + Math.sin(animTime + item.offset) * 0.05);
         item.mesh.scale.set(s, s, s);
         item.mesh.rotation.y += 0.003;
       });
@@ -617,18 +650,29 @@ HTML_PAGE = """
       const baseColor = room.color;
       const hasFreshData = node.last_seen && (Date.now() - new Date(node.last_seen).getTime()) < 5000;
       const isActive = Boolean(node.motion);
+      const isConfirming = node.motion_label === 'CONFIRMING_TARGET';
+      const isPredator = node.motion_label === 'PREDATOR_DETECTED';
 
       sphere.material.color.setHex(baseColor);
-      if (node.sensor_ok) {
-        sphere.material.opacity = isActive ? 0.34 : 0.14;
+      if (isPredator) {
+        sphere.material.opacity = 0.42;
+        sphere.userData.dynamicScale = 1.48;
+      } else if (isConfirming) {
+        sphere.material.opacity = 0.30;
+        sphere.userData.dynamicScale = 1.28;
+      } else if (node.sensor_ok) {
+        sphere.material.opacity = isActive ? 0.24 : 0.12;
+        sphere.userData.dynamicScale = 1.04;
       } else if (hasFreshData) {
         sphere.material.opacity = 0.08;
+        sphere.userData.dynamicScale = 0.98;
       } else {
         sphere.material.opacity = 0.04;
+        sphere.userData.dynamicScale = 0.92;
       }
 
       if (pointLight) {
-        pointLight.intensity = isActive ? 2.4 : (hasFreshData ? 1.1 : 0.45);
+        pointLight.intensity = isPredator ? 2.9 : isConfirming ? 2.1 : (hasFreshData ? 0.9 : 0.35);
       }
     }
     
