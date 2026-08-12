@@ -2,6 +2,8 @@ import asyncio
 import json
 import logging
 import os
+import re
+import subprocess
 from datetime import datetime
 from typing import Dict, Set
 
@@ -168,8 +170,46 @@ async def main() -> None:
     await asyncio.gather(*tasks)
 
 
+def _get_listener_pid(port: int) -> int | None:
+    """Best-effort lookup of the PID currently listening on a TCP port."""
+    try:
+        result = subprocess.run(
+            ["ss", "-ltnp"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    if result.returncode != 0:
+        return None
+
+    needle = f":{port}"
+    pid_re = re.compile(r"pid=(\d+)")
+    for line in result.stdout.splitlines():
+        if needle not in line:
+            continue
+        match = pid_re.search(line)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+    return None
+
+
 if __name__ == "__main__":
     try:
         asyncio.run(main())
+    except OSError as exc:
+        if exc.errno == 98:
+            pid = _get_listener_pid(8765)
+            if pid is not None:
+                logging.error("[SYSTEM] Hub already running on 8765 (pid %d). Stop it first or use the existing instance.", pid)
+            else:
+                logging.error("[SYSTEM] Port 8765 is already in use. Stop the existing hub or other listener and retry.")
+        else:
+            raise
     except KeyboardInterrupt:
         logging.info("[SYSTEM] Hub shut down cleanly")
