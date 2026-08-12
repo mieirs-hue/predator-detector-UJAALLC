@@ -35,6 +35,9 @@ def build_node_state(node_id: str) -> dict:
     "motion_intensity": "idle",
     "rssi": None,
     "strength": 0,
+    "distance_cm": None,
+    "sensor_status": "UNKNOWN",
+    "sensor_ok": False,
     "last_seen": None,
     "source": "Awaiting telemetry",
     "siren_on": False,
@@ -101,6 +104,15 @@ def update_motion_state(node: dict, packet: dict) -> None:
   state = zone_data.get("state", {}) if isinstance(zone_data, dict) else {}
   raw = zone_data.get("raw_telemetry", {}) if isinstance(zone_data, dict) else {}
 
+  distance_cm = raw.get("distance_cm")
+  try:
+    distance_value = int(distance_cm) if distance_cm is not None else None
+  except (TypeError, ValueError):
+    distance_value = None
+
+  sensor_status = str(raw.get("status", "UNKNOWN")).upper()
+  sensor_ok = sensor_status == "OK" and distance_value is not None and distance_value >= 0
+
   rssi = state.get("rssi")
   if rssi is None:
     rssi = raw.get("rssi")
@@ -110,6 +122,11 @@ def update_motion_state(node: dict, packet: dict) -> None:
     rssi_value = None
 
   motion_active = state.get("state") == "HOLD"
+
+  # Primary target confirmation path: valid TF-Luna distance in a near-field envelope.
+  if sensor_ok:
+    motion_active = distance_value <= 300
+
   if not motion_active and rssi_value is not None:
     motion_active = rssi_value >= float(node["baseline_rssi"]) + 5.0
 
@@ -118,6 +135,9 @@ def update_motion_state(node: dict, packet: dict) -> None:
   node["motion_intensity"] = "high" if motion_active else "idle"
   node["rssi"] = rssi_value
   node["strength"] = state.get("strength", 0)
+  node["distance_cm"] = distance_value
+  node["sensor_status"] = sensor_status
+  node["sensor_ok"] = sensor_ok
   node["last_seen"] = datetime.now().isoformat()
   node["source"] = zone_data.get("lighthouse") or raw.get("node_name") or raw.get("node_id") or "unknown"
   node["last_packet"] = packet
@@ -522,6 +542,7 @@ HTML_PAGE = """
         scene.add(nodeGroup);
         room.sensorGroup = nodeGroup;
         room.sphereMesh = sphere;
+        room.pointLight = pointLight;
       });
       
       // DIMENSION LABEL
@@ -586,6 +607,30 @@ HTML_PAGE = """
       if (distEl) distEl.textContent = packet.distance_cm >= 0 ? `${packet.distance_cm} cm` : 'ERR';
       if (dotEl)  dotEl.innerHTML = `<span class="dot"></span> ${packet.status || 'LIVE'}`;
     }
+
+    function updateRoomVisual(node) {
+      const room = ROOMS[node.node_id];
+      if (!room || !room.sphereMesh) return;
+
+      const sphere = room.sphereMesh;
+      const pointLight = room.pointLight;
+      const baseColor = room.color;
+      const hasFreshData = node.last_seen && (Date.now() - new Date(node.last_seen).getTime()) < 5000;
+      const isActive = Boolean(node.motion);
+
+      sphere.material.color.setHex(baseColor);
+      if (node.sensor_ok) {
+        sphere.material.opacity = isActive ? 0.34 : 0.14;
+      } else if (hasFreshData) {
+        sphere.material.opacity = 0.08;
+      } else {
+        sphere.material.opacity = 0.04;
+      }
+
+      if (pointLight) {
+        pointLight.intensity = isActive ? 2.4 : (hasFreshData ? 1.1 : 0.45);
+      }
+    }
     
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
     const socket = new WebSocket(`${protocol}://${location.host}/ws/dashboard`);
@@ -596,6 +641,8 @@ HTML_PAGE = """
     const controlStateEl = document.getElementById('controlState');
     const broadcastStateEl = document.getElementById('broadcastState');
     const sirenTestButton = document.getElementById('btn-siren-test');
+    const nodeControlBindings = {};
+    const nodeRowBindings = {};
 
     if (sirenTestButton) {
       sirenTestButton.addEventListener('click', () => {
@@ -625,44 +672,103 @@ HTML_PAGE = """
       controlStateEl.textContent = `${nodeId} ${feature} command sent`;
     }
 
+    function ensureNodeControls(nodes) {
+      for (const node of nodes) {
+        if (!nodeControlBindings[node.node_id]) {
+          const nodeControl = document.createElement('div');
+          nodeControl.className = 'node-control';
+
+          const title = document.createElement('h4');
+          title.textContent = `${node.node_id} · ${node.label}`;
+
+          const meta = document.createElement('div');
+          meta.className = 'node-meta';
+          const pill = document.createElement('span');
+          pill.className = 'node-pill';
+          const source = document.createElement('span');
+          meta.appendChild(pill);
+          meta.appendChild(source);
+
+          const controls = document.createElement('div');
+          controls.className = 'control-grid';
+
+          const sirenButton = document.createElement('button');
+          sirenButton.className = 'control-button';
+          sirenButton.addEventListener('click', () => {
+            const current = nodeControlBindings[node.node_id]?.state;
+            sendControl(node.node_id, 'siren', !Boolean(current?.siren_on));
+          });
+
+          const intercomButton = document.createElement('button');
+          intercomButton.className = 'control-button';
+          intercomButton.addEventListener('click', () => {
+            const current = nodeControlBindings[node.node_id]?.state;
+            sendControl(node.node_id, 'intercom', !Boolean(current?.intercom_on));
+          });
+
+          controls.appendChild(sirenButton);
+          controls.appendChild(intercomButton);
+          nodeControl.appendChild(title);
+          nodeControl.appendChild(meta);
+          nodeControl.appendChild(controls);
+          controlPanelEl.appendChild(nodeControl);
+
+          const row = document.createElement('tr');
+          const colNode = document.createElement('td');
+          const colMotion = document.createElement('td');
+          const colSignal = document.createElement('td');
+          const colState = document.createElement('td');
+          const colLast = document.createElement('td');
+          row.appendChild(colNode);
+          row.appendChild(colMotion);
+          row.appendChild(colSignal);
+          row.appendChild(colState);
+          row.appendChild(colLast);
+          rowsEl.appendChild(row);
+
+          nodeControlBindings[node.node_id] = { nodeControl, pill, source, sirenButton, intercomButton, state: null };
+          nodeRowBindings[node.node_id] = { colNode, colMotion, colSignal, colState, colLast };
+        }
+      }
+    }
+
+    function updateNodeControl(node) {
+      const ui = nodeControlBindings[node.node_id];
+      if (!ui) return;
+
+      ui.state = node;
+      ui.pill.textContent = node.motion_label;
+      ui.source.textContent = node.source;
+
+      ui.sirenButton.dataset.active = String(Boolean(node.siren_on));
+      ui.sirenButton.innerHTML = `${node.siren_on ? 'Siren On' : 'Siren Off'}<small>Audible alarm for ${node.label}. Starts silenced.</small>`;
+
+      ui.intercomButton.dataset.active = String(Boolean(node.intercom_on));
+      ui.intercomButton.innerHTML = `${node.intercom_on ? 'Intercom On' : 'Intercom Off'}<small>Two-way talkback for ${node.label}.</small>`;
+    }
+
+    function updateNodeRow(node) {
+      const row = nodeRowBindings[node.node_id];
+      if (!row) return;
+
+      row.colNode.textContent = node.node_id;
+      row.colMotion.textContent = node.motion_label;
+      row.colSignal.textContent = node.distance_cm != null && node.distance_cm >= 0 ? `${node.distance_cm} cm` : (node.rssi ?? 'n/a');
+      row.colState.textContent = node.motion ? 'MOTION' : (node.sensor_status || 'CLEAR');
+      row.colLast.textContent = formatAgo(node.last_seen);
+    }
+
     function renderDashboard(state) {
       const nodes = state.nodes || [];
       const activeNodes = nodes.filter((node) => node.motion).map((node) => node.label);
       statusEl.textContent = state.hub?.connected ? (activeNodes.length ? `Connected · ${activeNodes.join(', ')} active` : 'Connected · all rooms clear') : 'Waiting for telemetry…';
       controlStateEl.textContent = state.message || 'Idle';
       broadcastStateEl.textContent = state.hub?.status || 'No commands sent yet';
-
-      controlPanelEl.innerHTML = '';
-      rowsEl.innerHTML = '';
-
+      ensureNodeControls(nodes);
       for (const node of nodes) {
-        const nodeControl = document.createElement('div');
-        nodeControl.className = 'node-control';
-        nodeControl.innerHTML = `<h4>${node.node_id} · ${node.label}</h4><div class=\"node-meta\"><span class=\"node-pill\">${node.motion_label}</span><span>${node.source}</span></div>`;
-
-        const controls = document.createElement('div');
-        controls.className = 'control-grid';
-
-        const sirenButton = document.createElement('button');
-        sirenButton.className = 'control-button';
-        sirenButton.dataset.active = String(Boolean(node.siren_on));
-        sirenButton.innerHTML = `${node.siren_on ? 'Siren On' : 'Siren Off'}<small>Audible alarm for ${node.label}. Starts silenced.</small>`;
-        sirenButton.addEventListener('click', () => sendControl(node.node_id, 'siren', !node.siren_on));
-
-        const intercomButton = document.createElement('button');
-        intercomButton.className = 'control-button';
-        intercomButton.dataset.active = String(Boolean(node.intercom_on));
-        intercomButton.innerHTML = `${node.intercom_on ? 'Intercom On' : 'Intercom Off'}<small>Two-way talkback for ${node.label}.</small>`;
-        intercomButton.addEventListener('click', () => sendControl(node.node_id, 'intercom', !node.intercom_on));
-
-        controls.appendChild(sirenButton);
-        controls.appendChild(intercomButton);
-        nodeControl.appendChild(controls);
-        controlPanelEl.appendChild(nodeControl);
-
-        const row = document.createElement('tr');
-        row.innerHTML = `<td>${node.node_id}</td><td>${node.motion_label}</td><td>${node.rssi ?? 'n/a'}</td><td>${node.motion ? 'MOTION' : 'CLEAR'}</td><td>${formatAgo(node.last_seen)}</td>`;
-        rowsEl.appendChild(row);
+        updateNodeControl(node);
+        updateNodeRow(node);
+        updateRoomVisual(node);
       }
 
       latestEl.textContent = JSON.stringify(state.latest_packet || {}, null, 2);
