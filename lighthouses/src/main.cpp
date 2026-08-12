@@ -22,6 +22,46 @@ uint8_t last_i2c_n = 0;
 uint8_t last_i2c_b0 = 0;
 uint8_t last_i2c_b1 = 0;
 uint8_t last_i2c_mode = 0;
+uint8_t i2c_scan_count = 0;
+uint8_t i2c_scan_first_addr = 0;
+uint8_t i2c_scan_last_addr = 0;
+bool i2c_scan_tf_luna_present = false;
+char i2c_scan_addrs[96] = "";
+
+void runI2CScan() {
+    i2c_scan_count = 0;
+    i2c_scan_first_addr = 0;
+    i2c_scan_last_addr = 0;
+    i2c_scan_tf_luna_present = false;
+    i2c_scan_addrs[0] = '\0';
+
+    size_t used = 0;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        uint8_t err = Wire.endTransmission();
+        if (err != 0) continue;
+
+        if (i2c_scan_count == 0) i2c_scan_first_addr = addr;
+        i2c_scan_last_addr = addr;
+        i2c_scan_count++;
+        if (addr == TF_LUNA_ADDR) i2c_scan_tf_luna_present = true;
+
+        if (used < sizeof(i2c_scan_addrs) - 1) {
+            int wrote = snprintf(
+                i2c_scan_addrs + used,
+                sizeof(i2c_scan_addrs) - used,
+                "%s0x%02X",
+                (used == 0) ? "" : ",",
+                addr
+            );
+            if (wrote > 0) used += (size_t)wrote;
+            if (used >= sizeof(i2c_scan_addrs)) {
+                i2c_scan_addrs[sizeof(i2c_scan_addrs) - 1] = '\0';
+                break;
+            }
+        }
+    }
+}
 
 int parseDistanceFrom9(const uint8_t* buf) {
     // TF-Luna UART-compatible frame over I2C bridge.
@@ -119,6 +159,7 @@ void setup() {
 
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setClock(I2C_CLOCK_HZ);
+    runI2CScan();
 
     pinMode(TF_LUNA_INT, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(TF_LUNA_INT), handleLidarInterrupt, RISING);
@@ -136,7 +177,7 @@ void loop() {
 
     int dist = get_TFLuna_Distance();
 
-    StaticJsonDocument<256> doc;
+    StaticJsonDocument<384> doc;
     doc["node_id"]      = NODE_NAME;
     doc["timestamp_ms"] = now;
     doc["sequence"]     = sequence_num++;
@@ -149,6 +190,11 @@ void loop() {
     doc["i2c_last_b0"]  = last_i2c_b0;
     doc["i2c_last_b1"]  = last_i2c_b1;
     doc["i2c_last_mode"] = last_i2c_mode;
+    doc["i2c_scan_count"] = i2c_scan_count;
+    doc["i2c_scan_first_addr"] = i2c_scan_first_addr;
+    doc["i2c_scan_last_addr"] = i2c_scan_last_addr;
+    doc["i2c_scan_tf_luna_present"] = i2c_scan_tf_luna_present;
+    doc["i2c_scan_addrs"] = i2c_scan_addrs;
     doc["supply_note"]  = "TF-Luna needs >=4.5V";
 
     serializeJson(doc, Serial);
