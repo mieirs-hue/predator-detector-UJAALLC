@@ -304,6 +304,7 @@ HTML_PAGE = """
     };
     
     let scene, camera, renderer, orbitControls;
+    let threeInitialized = false;
     const animatedSpheres = [];
     const nodeSpheres = {};
     const speakerNodes = [
@@ -312,8 +313,8 @@ HTML_PAGE = """
       { id: 'FSS-N03', zone: "Baby\'s Room" },
       { id: 'FSS-N04', zone: 'Entryway' },
     ];
-    let currentSpeakerIndex = 0;
     let audioContext = null;
+    let speakerSequenceRunning = false;
 
     function getAudioContext() {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -364,28 +365,66 @@ HTML_PAGE = """
       }, 500);
     }
 
-    async function cycleSpeakerTest() {
-      const targetNode = speakerNodes[currentSpeakerIndex];
+    function isSocketOpen() {
+      return socket && socket.readyState === WebSocket.OPEN;
+    }
+
+    function waitMs(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    async function runSpeakerSequence() {
+      if (speakerSequenceRunning) return;
+      speakerSequenceRunning = true;
+
       const statusElem = document.getElementById('speaker-status');
-
-      await playWebSirenTone(500);
-      highlightNodeSphere(targetNode.id);
-
-      if (statusElem) {
-        statusElem.innerHTML = `TESTING: <b style="color:#44d7ff">${targetNode.id}</b> (${targetNode.zone})`;
+      const button = document.getElementById('btn-siren-test');
+      if (button) {
+        button.disabled = true;
+        button.textContent = 'Running Speaker Sequence...';
       }
 
-      socket.send(JSON.stringify({
-        type: 'speaker_test',
-        event: 'speaker_test',
-        nodeId: targetNode.id,
-        zone: targetNode.zone,
-        durationMs: 500,
-        sweepStartHz: 400,
-        sweepEndHz: 1400,
-      }));
+      try {
+        for (const targetNode of speakerNodes) {
+          await playWebSirenTone(500);
+          highlightNodeSphere(targetNode.id);
 
-      currentSpeakerIndex = (currentSpeakerIndex + 1) % speakerNodes.length;
+          if (statusElem) {
+            statusElem.innerHTML = `TESTING: <b style="color:#44d7ff">${targetNode.id}</b> (${targetNode.zone})`;
+          }
+
+          if (isSocketOpen()) {
+            socket.send(JSON.stringify({
+              type: 'speaker_test',
+              event: 'speaker_test',
+              nodeId: targetNode.id,
+              zone: targetNode.zone,
+              durationMs: 500,
+              sweepStartHz: 400,
+              sweepEndHz: 1400,
+            }));
+          }
+
+          await waitMs(600);
+        }
+
+        if (statusElem) {
+          statusElem.textContent = 'Ready to test (click to cycle nodes)';
+        }
+      } finally {
+        speakerSequenceRunning = false;
+        if (button) {
+          button.disabled = false;
+          button.textContent = 'Cycle Speaker Check (0.5s)';
+        }
+      }
+    }
+
+    function initializeThreeSceneOnce() {
+      if (threeInitialized) return;
+      buildNodeCards();
+      initThreeJS();
+      threeInitialized = true;
     }
     
     function initThreeJS() {
@@ -560,7 +599,7 @@ HTML_PAGE = """
 
     if (sirenTestButton) {
       sirenTestButton.addEventListener('click', () => {
-        cycleSpeakerTest().catch(() => {
+        runSpeakerSequence().catch(() => {
           const statusElem = document.getElementById('speaker-status');
           if (statusElem) {
             statusElem.textContent = 'Audio context unavailable or command failed';
@@ -578,6 +617,10 @@ HTML_PAGE = """
     }
 
     function sendControl(nodeId, feature, enabled) {
+      if (!isSocketOpen()) {
+        controlStateEl.textContent = 'Dashboard socket not connected';
+        return;
+      }
       socket.send(JSON.stringify({ type: 'control_command', nodeId, feature, enabled }));
       controlStateEl.textContent = `${nodeId} ${feature} command sent`;
     }
@@ -624,15 +667,15 @@ HTML_PAGE = """
 
       latestEl.textContent = JSON.stringify(state.latest_packet || {}, null, 2);
       // update node cards with live distance
-      if (state.latest_packet && state.latest_packet.node_id) {
-        updateNodeCard(state.latest_packet.node_id, state.latest_packet);
+      const latestRaw = state.latest_packet?.zone_data?.raw_telemetry;
+      if (latestRaw && latestRaw.node_id) {
+        updateNodeCard(latestRaw.node_id, latestRaw);
       }
     }
 
     socket.onopen = () => { 
       controlStateEl.textContent = 'Connected to dashboard websocket';
-      buildNodeCards();
-      initThreeJS();
+      initializeThreeSceneOnce();
     };
     socket.onmessage = (event) => {
       try {
@@ -648,6 +691,9 @@ HTML_PAGE = """
     };
     socket.onerror = () => { statusEl.textContent = 'Dashboard socket error'; };
     socket.onclose = () => { statusEl.textContent = 'Dashboard socket closed'; };
+
+    // Render 3D scene even if websocket connect is delayed.
+    initializeThreeSceneOnce();
   </script>
 </body>
 </html>
