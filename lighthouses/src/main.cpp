@@ -9,7 +9,10 @@
 #define I2C_SDA_PIN   10
 #define I2C_SCL_PIN   11
 #define TF_LUNA_ADDR  0x10
-#define TF_LUNA_INT   3
+
+#ifndef TF_LUNA_INT_PIN
+#define TF_LUNA_INT_PIN -1
+#endif
 
 const uint32_t I2C_CLOCK_HZ = 100000;
 const uint8_t LIDAR_READ_RETRIES = 3;
@@ -27,6 +30,7 @@ uint8_t i2c_scan_first_addr = 0;
 uint8_t i2c_scan_last_addr = 0;
 bool i2c_scan_tf_luna_present = false;
 char i2c_scan_addrs[96] = "";
+bool tf_luna_int_enabled = false;
 
 void runI2CScan() {
     i2c_scan_count = 0;
@@ -161,8 +165,11 @@ void setup() {
     Wire.setClock(I2C_CLOCK_HZ);
     runI2CScan();
 
-    pinMode(TF_LUNA_INT, INPUT_PULLUP);
-    attachInterrupt(digitalPinToInterrupt(TF_LUNA_INT), handleLidarInterrupt, RISING);
+    if (TF_LUNA_INT_PIN >= 0) {
+        pinMode(TF_LUNA_INT_PIN, INPUT_PULLUP);
+        attachInterrupt(digitalPinToInterrupt(TF_LUNA_INT_PIN), handleLidarInterrupt, RISING);
+        tf_luna_int_enabled = true;
+    }
 
     Serial.printf("[%s] Ready.\n", NODE_NAME);
 }
@@ -195,6 +202,8 @@ void loop() {
     doc["i2c_scan_last_addr"] = i2c_scan_last_addr;
     doc["i2c_scan_tf_luna_present"] = i2c_scan_tf_luna_present;
     doc["i2c_scan_addrs"] = i2c_scan_addrs;
+    doc["tf_luna_int_pin"] = TF_LUNA_INT_PIN;
+    doc["tf_luna_int_enabled"] = tf_luna_int_enabled;
     doc["supply_note"]  = "TF-Luna needs >=4.5V";
 
     serializeJson(doc, Serial);
