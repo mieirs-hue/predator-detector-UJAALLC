@@ -398,6 +398,7 @@ HTML_PAGE = """
       { id: 'FSS-N03', zone: "Baby\'s Room" },
       { id: 'FSS-N04', zone: 'Entryway' },
     ];
+    let latestDashboardState = null;
     let audioContext = null;
     let speakerSequenceRunning = false;
 
@@ -509,7 +510,15 @@ HTML_PAGE = """
       }
 
       try {
-        for (const targetNode of speakerNodes) {
+        const liveNodeIds = new Set(
+          (latestDashboardState?.nodes || [])
+            .filter((n) => !!n.last_seen)
+            .map((n) => n.node_id)
+        );
+        const targets = speakerNodes.filter((n) => liveNodeIds.has(n.id));
+        const sequenceTargets = targets.length ? targets : speakerNodes;
+
+        for (const targetNode of sequenceTargets) {
           await playWebSirenTone(500);
           highlightNodeSphere(targetNode.id);
 
@@ -904,6 +913,7 @@ HTML_PAGE = """
     }
 
     function renderDashboard(state) {
+      latestDashboardState = state;
       const nodes = state.nodes || [];
       const activeNodes = nodes.filter((node) => node.motion).map((node) => node.label);
       statusEl.textContent = state.hub?.connected ? (activeNodes.length ? `Connected · ${activeNodes.join(', ')} active` : 'Connected · all rooms clear') : 'Waiting for telemetry…';
