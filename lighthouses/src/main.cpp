@@ -40,6 +40,8 @@ bool i2c_scan_tf_luna_present = false;
 char i2c_scan_addrs[96] = "";
 bool tf_luna_int_enabled = false;
 bool audio_ready = false;
+char last_audio_cmd[16] = "NONE";
+unsigned long last_audio_cmd_ms = 0;
 
 void runI2CScan() {
     i2c_scan_count = 0;
@@ -125,7 +127,7 @@ void setupAudioOutput() {
     audio_ready = true;
 }
 
-void playTone(int frequency, int duration_ms, int amplitude = 2200) {
+void playTone(int frequency, int duration_ms, int amplitude = 8000) {
     if (!audio_ready || frequency <= 0 || duration_ms <= 0) return;
 
     const int sample_rate = 16000;
@@ -141,14 +143,22 @@ void playTone(int frequency, int duration_ms, int amplitude = 2200) {
 }
 
 void handleAudioCommand(const String& command) {
+    snprintf(last_audio_cmd, sizeof(last_audio_cmd), "%s", command.c_str());
+    last_audio_cmd_ms = millis();
+
     if (command == "BEEP") {
-        playTone(800, 180, 2200);
+        // Distinct triple-beep pattern for easy human verification at distance.
+        playTone(950, 180, 9000);
+        delay(70);
+        playTone(950, 180, 9000);
+        delay(70);
+        playTone(950, 180, 9000);
         return;
     }
 
     if (command == "SIREN") {
-        playTone(1200, 220, 2600);
-        playTone(700, 220, 2600);
+        playTone(1450, 320, 10500);
+        playTone(760, 320, 10500);
         return;
     }
 }
@@ -268,6 +278,13 @@ void setup() {
 
     setupAudioOutput();
 
+    if (audio_ready) {
+        // Startup chirp confirms amp path is alive immediately after boot.
+        playTone(650, 110, 7000);
+        delay(40);
+        playTone(980, 110, 7000);
+    }
+
     Serial.printf("[%s] Ready.\n", NODE_NAME);
 }
 
@@ -311,6 +328,8 @@ void loop() {
     doc["tf_luna_int_pin"] = TF_LUNA_INT_PIN;
     doc["tf_luna_int_enabled"] = tf_luna_int_enabled;
     doc["audio_ready"] = audio_ready;
+    doc["last_audio_cmd"] = last_audio_cmd;
+    doc["last_audio_cmd_ms"] = last_audio_cmd_ms;
     doc["supply_note"]  = "TF-Luna needs >=4.5V";
 
     serializeJson(doc, Serial);
