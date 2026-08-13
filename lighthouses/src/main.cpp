@@ -25,9 +25,6 @@ const uint32_t I2C_CLOCK_HZ = 100000;
 const uint8_t LIDAR_READ_RETRIES = 3;
 const unsigned long INITIAL_DEBUG_SCAN_MS = 10000; // Continuously scan I2C for 10s on boot
 const unsigned long DEBUG_SCAN_INTERVAL_MS = 200;
-const int PROXIMITY_BEEP_THRESHOLD_CM = 180;
-const uint8_t PROXIMITY_BEEP_CONFIRM_COUNT = 2;
-const unsigned long PROXIMITY_BEEP_COOLDOWN_MS = 900;
 
 volatile bool newLidarDataReady = false;
 volatile int last_i2c_error = 0;
@@ -46,8 +43,7 @@ bool tf_luna_int_enabled = false;
 bool audio_ready = false;
 char last_audio_cmd[16] = "NONE";
 unsigned long last_audio_cmd_ms = 0;
-unsigned long last_proximity_beep_ms = 0;
-uint8_t proximity_hit_streak = 0;
+bool intercom_enabled = false;
 
 void runI2CScan() {
     i2c_scan_count = 0;
@@ -174,30 +170,6 @@ void playTone(int frequency, int duration_ms, float amplitudePct = 1.0f) {
     }
 }
 
-void maybeTriggerProximityBeep(int distance_cm, unsigned long now_ms) {
-    if (!audio_ready) return;
-    if (distance_cm <= 0) {
-        proximity_hit_streak = 0;
-        return;
-    }
-
-    if (distance_cm <= PROXIMITY_BEEP_THRESHOLD_CM) {
-        if (proximity_hit_streak < 255) proximity_hit_streak++;
-    } else {
-        proximity_hit_streak = 0;
-        return;
-    }
-
-    if (proximity_hit_streak < PROXIMITY_BEEP_CONFIRM_COUNT) return;
-    if ((now_ms - last_proximity_beep_ms) < PROXIMITY_BEEP_COOLDOWN_MS) return;
-
-    snprintf(last_audio_cmd, sizeof(last_audio_cmd), "%s", "AUTO_BEEP");
-    last_audio_cmd_ms = now_ms;
-    last_proximity_beep_ms = now_ms;
-    // Short local chirp for walk-up confirmation without alarm loudness.
-    playTone(1100, 60, 0.20f);
-}
-
 void handleAudioCommand(const String& command) {
     snprintf(last_audio_cmd, sizeof(last_audio_cmd), "%s", command.c_str());
     last_audio_cmd_ms = millis();
@@ -205,6 +177,20 @@ void handleAudioCommand(const String& command) {
     if (command == "PING") {
         // Quiet heartbeat ping for wiring/label validation.
         playTone(1000, 50, 0.10f);
+        return;
+    }
+
+    if (command == "INTERCOM_ON") {
+        intercom_enabled = true;
+        // Reserve the audio path for the live mic/intercom channel without triggering
+        // a local proximity chirp. The actual USB mic can plug in later and use this flag.
+        playTone(500, 80, 0.06f);
+        return;
+    }
+
+    if (command == "INTERCOM_OFF") {
+        intercom_enabled = false;
+        playTone(340, 80, 0.04f);
         return;
     }
 
@@ -384,7 +370,6 @@ void loop() {
     last_transmit = now;
 
     int dist = get_TFLuna_Distance();
-    maybeTriggerProximityBeep(dist, now);
 
     StaticJsonDocument<384> doc;
     doc["node_id"]      = NODE_NAME;

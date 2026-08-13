@@ -457,7 +457,6 @@ HTML_PAGE = """
     const animatedSpheres = [];
     const nodeSpheres = {};
     const lastNodeVisualState = {};
-    const lastAlertBeepAt = {};
     const speakerNodes = [
       { id: 'FSS-N01', zone: 'Office' },
       { id: 'FSS-N02', zone: 'Garage' },
@@ -499,34 +498,6 @@ HTML_PAGE = """
       gain.gain.setValueAtTime(0.001, now);
       gain.gain.linearRampToValueAtTime(0.25, now + 0.05);
       gain.gain.exponentialRampToValueAtTime(0.001, now + duration);
-
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      osc.start(now);
-      osc.stop(now + duration);
-    }
-
-    async function playAlertBeep(frequency = 920, durationMs = 220) {
-      const ctx = getAudioContext();
-      if (!ctx) return;
-      if (ctx.state === 'suspended') {
-        try {
-          await ctx.resume();
-        } catch (error) {
-          return;
-        }
-      }
-
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      const now = ctx.currentTime;
-      const duration = durationMs / 1000;
-
-      osc.type = 'square';
-      osc.frequency.setValueAtTime(frequency, now);
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.16, now + 0.03);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
 
       osc.connect(gain);
       gain.connect(ctx.destination);
@@ -1064,13 +1035,6 @@ HTML_PAGE = """
 
         if (enteredAlert) {
           triggerPhaseTracer(node.node_id, node.motion_label);
-          const nowMs = Date.now();
-          const lastBeep = lastAlertBeepAt[node.node_id] || 0;
-          if ((nowMs - lastBeep) >= 3500) {
-            const alertHz = node.motion_label === 'PREDATOR_DETECTED' ? 1240 : 920;
-            playAlertBeep(alertHz, 220).catch(() => {});
-            lastAlertBeepAt[node.node_id] = nowMs;
-          }
         }
 
         lastNodeVisualState[node.node_id] = node.motion_label;

@@ -95,7 +95,7 @@ async def handle_websocket_message(websocket, message: str) -> None:
             await route_audio_command(node_id, "SIREN")
             return
         if feature == "intercom":
-            await route_audio_command(node_id, "BEEP")
+            await route_audio_command(node_id, "INTERCOM_ON" if enabled else "INTERCOM_OFF")
             return
         if feature == "ping":
             await route_audio_command(node_id, "PING")
