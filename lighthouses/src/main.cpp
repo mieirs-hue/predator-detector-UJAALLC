@@ -2,19 +2,20 @@
 #include <Wire.h>
 #include <ArduinoJson.h>
 #include <driver/i2s.h>
+#include <io_pin_remap.h>
 
 #ifndef NODE_NAME
 #define NODE_NAME "FSS-N01"
 #endif
 
-#define I2C_SDA_PIN   10
-#define I2C_SCL_PIN   11
+#define I2C_SDA_PIN   D10
+#define I2C_SCL_PIN   D11
 #define TF_LUNA_ADDR  0x10
 
 #define AMP_I2S_PORT  I2S_NUM_1
-#define AMP_BCLK_PIN  4
-#define AMP_LRC_PIN   5
-#define AMP_DIN_PIN   6
+#define AMP_BCLK_PIN  D4
+#define AMP_LRC_PIN   D5
+#define AMP_DIN_PIN   D6
 
 #ifndef TF_LUNA_INT_PIN
 #define TF_LUNA_INT_PIN -1
@@ -24,6 +25,9 @@ const uint32_t I2C_CLOCK_HZ = 100000;
 const uint8_t LIDAR_READ_RETRIES = 3;
 const unsigned long INITIAL_DEBUG_SCAN_MS = 10000; // Continuously scan I2C for 10s on boot
 const unsigned long DEBUG_SCAN_INTERVAL_MS = 200;
+const int PROXIMITY_BEEP_THRESHOLD_CM = 180;
+const uint8_t PROXIMITY_BEEP_CONFIRM_COUNT = 2;
+const unsigned long PROXIMITY_BEEP_COOLDOWN_MS = 900;
 
 volatile bool newLidarDataReady = false;
 volatile int last_i2c_error = 0;
@@ -42,6 +46,8 @@ bool tf_luna_int_enabled = false;
 bool audio_ready = false;
 char last_audio_cmd[16] = "NONE";
 unsigned long last_audio_cmd_ms = 0;
+unsigned long last_proximity_beep_ms = 0;
+uint8_t proximity_hit_streak = 0;
 
 void runI2CScan() {
     i2c_scan_count = 0;
@@ -88,6 +94,22 @@ int parseDistanceFrom9(const uint8_t* buf) {
 }
 
 void setupAudioOutput() {
+    int8_t bclk_gpio = digitalPinToGPIONumber(AMP_BCLK_PIN);
+    int8_t lrc_gpio = digitalPinToGPIONumber(AMP_LRC_PIN);
+    int8_t din_gpio = digitalPinToGPIONumber(AMP_DIN_PIN);
+
+    if (bclk_gpio < 0 || lrc_gpio < 0 || din_gpio < 0) {
+        Serial.printf(
+            "[%s] Audio pin remap failed: D4->%d D5->%d D6->%d\n",
+            NODE_NAME,
+            (int)bclk_gpio,
+            (int)lrc_gpio,
+            (int)din_gpio
+        );
+        audio_ready = false;
+        return;
+    }
+
     i2s_config_t amp_config = {
         .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
         .sample_rate = 16000,
@@ -103,9 +125,9 @@ void setupAudioOutput() {
     };
 
     i2s_pin_config_t amp_pins = {
-        .bck_io_num = AMP_BCLK_PIN,
-        .ws_io_num = AMP_LRC_PIN,
-        .data_out_num = AMP_DIN_PIN,
+        .bck_io_num = bclk_gpio,
+        .ws_io_num = lrc_gpio,
+        .data_out_num = din_gpio,
         .data_in_num = I2S_PIN_NO_CHANGE
     };
 
@@ -124,41 +146,80 @@ void setupAudioOutput() {
         return;
     }
 
+    Serial.printf(
+        "[%s] Audio GPIO map: BCLK D4->%d, LRC D5->%d, DIN D6->%d\n",
+        NODE_NAME,
+        (int)bclk_gpio,
+        (int)lrc_gpio,
+        (int)din_gpio
+    );
+
     audio_ready = true;
 }
 
-void playTone(int frequency, int duration_ms, int amplitude = 8000) {
+void playTone(int frequency, int duration_ms, float amplitudePct = 1.0f) {
     if (!audio_ready || frequency <= 0 || duration_ms <= 0) return;
 
     const int sample_rate = 16000;
     const int total_samples = (sample_rate * duration_ms) / 1000;
-    const int half_period = max(1, sample_rate / (frequency * 2));
+    const float clampedPct = constrain(amplitudePct, 0.0f, 1.0f);
+    const int16_t maxVol = (int16_t)(10000.0f * clampedPct);
+    const int half_period = max(1, sample_rate / max(1, frequency * 2));
     size_t bytes_written = 0;
 
     for (int i = 0; i < total_samples; i++) {
-        int16_t sample = ((i / half_period) % 2 == 0) ? amplitude : -amplitude;
-        int16_t frame[2] = { sample, sample };
-        i2s_write(AMP_I2S_PORT, frame, sizeof(frame), &bytes_written, portMAX_DELAY);
+        int16_t sample = ((i / half_period) % 2 == 0) ? maxVol : -maxVol;
+        uint32_t frame = (((uint32_t)(uint16_t)sample) << 16) | (uint16_t)sample;
+        i2s_write(AMP_I2S_PORT, &frame, sizeof(frame), &bytes_written, portMAX_DELAY);
     }
+}
+
+void maybeTriggerProximityBeep(int distance_cm, unsigned long now_ms) {
+    if (!audio_ready) return;
+    if (distance_cm <= 0) {
+        proximity_hit_streak = 0;
+        return;
+    }
+
+    if (distance_cm <= PROXIMITY_BEEP_THRESHOLD_CM) {
+        if (proximity_hit_streak < 255) proximity_hit_streak++;
+    } else {
+        proximity_hit_streak = 0;
+        return;
+    }
+
+    if (proximity_hit_streak < PROXIMITY_BEEP_CONFIRM_COUNT) return;
+    if ((now_ms - last_proximity_beep_ms) < PROXIMITY_BEEP_COOLDOWN_MS) return;
+
+    snprintf(last_audio_cmd, sizeof(last_audio_cmd), "%s", "AUTO_BEEP");
+    last_audio_cmd_ms = now_ms;
+    last_proximity_beep_ms = now_ms;
+    // Short local chirp for walk-up confirmation without alarm loudness.
+    playTone(1100, 60, 0.20f);
 }
 
 void handleAudioCommand(const String& command) {
     snprintf(last_audio_cmd, sizeof(last_audio_cmd), "%s", command.c_str());
     last_audio_cmd_ms = millis();
 
+    if (command == "PING") {
+        // Quiet heartbeat ping for wiring/label validation.
+        playTone(1000, 50, 0.10f);
+        return;
+    }
+
     if (command == "BEEP") {
-        // Distinct triple-beep pattern for easy human verification at distance.
-        playTone(950, 180, 9000);
-        delay(70);
-        playTone(950, 180, 9000);
-        delay(70);
-        playTone(950, 180, 9000);
+        // Standard operator beep.
+        playTone(800, 200, 0.80f);
         return;
     }
 
     if (command == "SIREN") {
-        playTone(1450, 320, 10500);
-        playTone(760, 320, 10500);
+        // Predator alarm burst.
+        for (int i = 0; i < 3; i++) {
+            playTone(1400, 400, 1.0f);
+            playTone(600, 400, 1.0f);
+        }
         return;
     }
 }
@@ -266,6 +327,17 @@ void setup() {
     Serial.begin(921600);
     delay(1000);
 
+    Serial.printf(
+        "[%s] Pin map (logical D-pins): TF_SDA=%d TF_SCL=%d AMP_BCLK=%d AMP_LRC=%d AMP_DIN=%d TF_INT=%d\n",
+        NODE_NAME,
+        (int)I2C_SDA_PIN,
+        (int)I2C_SCL_PIN,
+        (int)AMP_BCLK_PIN,
+        (int)AMP_LRC_PIN,
+        (int)AMP_DIN_PIN,
+        (int)TF_LUNA_INT_PIN
+    );
+
     Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.setClock(I2C_CLOCK_HZ);
     runI2CScan();
@@ -280,9 +352,15 @@ void setup() {
 
     if (audio_ready) {
         // Startup chirp confirms amp path is alive immediately after boot.
-        playTone(650, 110, 7000);
+        playTone(650, 110, 0.70f);
         delay(40);
-        playTone(980, 110, 7000);
+        playTone(980, 110, 0.70f);
+        // Distinct 3-tone startup chirp to confirm audio path is alive.
+        playTone(650, 80, 0.60f);
+        delay(80);
+        playTone(880, 80, 0.60f);
+        delay(80);
+        playTone(1200, 100, 0.70f);
     }
 
     Serial.printf("[%s] Ready.\n", NODE_NAME);
@@ -306,6 +384,7 @@ void loop() {
     last_transmit = now;
 
     int dist = get_TFLuna_Distance();
+    maybeTriggerProximityBeep(dist, now);
 
     StaticJsonDocument<384> doc;
     doc["node_id"]      = NODE_NAME;

@@ -18,21 +18,28 @@ if [[ ! -x "$PIO_BIN" ]]; then
 fi
 
 declare -A NODE_PORT=(
-  [north]="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:84:85:46:D8:CC-if00"
-  [south]="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_E0:72:A1:CE:D8:58-if00"
-  [east]="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:84:85:46:D9:68-if00"
-  [west]="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_E0:72:A1:F0:A3:48-if00"
+  [FSS-N01]="/dev/serial/by-id/usb-Arduino_NanoESP32_28848546D968-if01"
+  [FSS-N02]="/dev/serial/by-id/usb-Arduino_NanoESP32_28848546D8CC-if01"
+  [FSS-N03]="/dev/serial/by-id/usb-Arduino_NanoESP32_E072A1CED858-if01"
+  [FSS-N04]="/dev/serial/by-id/usb-Arduino_NanoESP32_E072A1F0A348-if01"
+)
+
+declare -A NODE_ENV=(
+  [FSS-N01]="FSS-N01"
+  [FSS-N02]="FSS-N02"
+  [FSS-N03]="FSS-N03"
+  [FSS-N04]="FSS-N04"
 )
 
 usage() {
   cat <<'EOF'
 Usage:
-  scripts/flash_fss_nodes.sh [--yes] [all|north|south|east|west]
+  scripts/flash_fss_nodes.sh [--yes] [all|FSS-N01|FSS-N02|FSS-N03|FSS-N04]
 
 Examples:
   scripts/flash_fss_nodes.sh all               # preview only (no flash)
   scripts/flash_fss_nodes.sh --yes all         # flash all four nodes
-  scripts/flash_fss_nodes.sh --yes north       # flash north only
+  scripts/flash_fss_nodes.sh --yes FSS-N03     # flash one node only
 
 Notes:
   - Without --yes, the script only prints intended actions.
@@ -53,7 +60,7 @@ while [[ $# -gt 0 ]]; do
       usage
       exit 0
       ;;
-    all|north|south|east|west)
+    all|FSS-N01|FSS-N02|FSS-N03|FSS-N04)
       TARGET="$1"
       shift
       ;;
@@ -70,7 +77,7 @@ if [[ ! -d "$FW_DIR" ]]; then
   exit 1
 fi
 
-NODES=(north south east west)
+NODES=(FSS-N01 FSS-N02 FSS-N03 FSS-N04)
 if [[ "$TARGET" != "all" ]]; then
   NODES=("$TARGET")
 fi
@@ -99,8 +106,9 @@ fi
 echo
 for node in "${NODES[@]}"; do
   port="${NODE_PORT[$node]}"
-  echo "Flashing $node on $port"
-  "$PIO_BIN" run -d "$FW_DIR" -e esp32s3 -t upload --upload-port "$port"
+  env_name="${NODE_ENV[$node]}"
+  echo "Flashing $node using env $env_name on $port"
+  "$PIO_BIN" run -d "$FW_DIR" -e "$env_name" -t upload --upload-port "$port"
 done
 
 echo "All requested flash operations completed."

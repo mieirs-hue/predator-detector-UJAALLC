@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import subprocess
+from pathlib import Path
 from datetime import datetime
 from typing import Dict, Set
 
@@ -13,13 +14,31 @@ import websockets
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(levelname)s: %(message)s")
 
 HUB_SERIAL_BAUD_RATE = 921600
+SERIAL_RETRY_DELAY_SECONDS = 2.0
 
-# Serial port → canonical node name (update port paths to match your Jetson)
-ZONE_MAP = {
-    "/dev/ttyACM0": "FSS-N01",
-    "/dev/ttyACM1": "FSS-N02",
-    "/dev/ttyACM2": "FSS-N03",
-    "/dev/ttyACM3": "FSS-N04",
+# Canonical node → candidate serial paths.
+# Prefer /dev/serial/by-id for stable mapping across reboots and reordering.
+ZONE_PORTS = {
+    "FSS-N01": [
+        "/dev/serial/by-id/usb-Arduino_NanoESP32_28848546D968-if01",
+        "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:84:85:46:D9:68-if00",
+        "/dev/ttyACM0",
+    ],
+    "FSS-N02": [
+        "/dev/serial/by-id/usb-Arduino_NanoESP32_28848546D8CC-if01",
+        "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:84:85:46:D8:CC-if00",
+        "/dev/ttyACM1",
+    ],
+    "FSS-N03": [
+        "/dev/serial/by-id/usb-Arduino_NanoESP32_E072A1CED858-if01",
+        "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_E0:72:A1:CE:D8:58-if00",
+        "/dev/ttyACM2",
+    ],
+    "FSS-N04": [
+        "/dev/serial/by-id/usb-Arduino_NanoESP32_E072A1F0A348-if01",
+        "/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_E0:72:A1:F0:A3:48-if00",
+        "/dev/ttyACM3",
+    ],
 }
 
 HYSTERESIS_CONFIG = {
@@ -31,6 +50,13 @@ HYSTERESIS_CONFIG = {
 active_locks: Dict[str, dict] = {}
 visualizer_clients: Set[object] = set()
 active_serial_ports: Dict[str, serial.Serial] = {}
+
+
+def resolve_available_port(node_name: str) -> str | None:
+    for candidate in ZONE_PORTS.get(node_name, []):
+        if Path(candidate).exists():
+            return candidate
+    return None
 
 
 async def handle_websocket_message(websocket, message: str) -> None:
@@ -55,7 +81,7 @@ async def handle_websocket_message(websocket, message: str) -> None:
             start_hz,
             end_hz,
         )
-        await route_audio_command(node_id, "BEEP")
+        await route_audio_command(node_id, "PING")
         return
 
     if event_type == "node_audio_command":
@@ -70,6 +96,9 @@ async def handle_websocket_message(websocket, message: str) -> None:
             return
         if feature == "intercom":
             await route_audio_command(node_id, "BEEP")
+            return
+        if feature == "ping":
+            await route_audio_command(node_id, "PING")
             return
 
 
@@ -124,63 +153,72 @@ def process_zone_hysteresis(zone_id: str, mac_address: str, rssi_sample: float) 
     }
 
 
-async def serial_endpoint_handler(port_path: str, node_name: str) -> None:
-    ser: serial.Serial | None = None
-    try:
-        ser = serial.Serial(port_path, HUB_SERIAL_BAUD_RATE, timeout=1)
-        active_serial_ports[node_name] = ser
-        logging.info("[BOOT] %s initialized on %s", node_name, port_path)
-        loop = asyncio.get_running_loop()
-        while True:
-            # readline() blocks; run in executor so asyncio stays responsive
-            raw_line = await loop.run_in_executor(
-                None, lambda: ser.readline().decode("utf-8", errors="ignore").strip()
-            )
-            if not raw_line:
-                continue
-            try:
-                packet = json.loads(raw_line)
-            except json.JSONDecodeError:
-                continue
+async def serial_endpoint_handler(node_name: str) -> None:
+    while True:
+        ser: serial.Serial | None = None
+        port_path = resolve_available_port(node_name)
+        if port_path is None:
+            logging.info("[WAIT] %s not present on any configured serial path", node_name)
+            await asyncio.sleep(SERIAL_RETRY_DELAY_SECONDS)
+            continue
 
-            # Canonical zone identity comes from the mapped serial port.
-            # This keeps room mapping stable even if a board was flashed with the wrong NODE_NAME.
-            reported_node_id = packet.get("node_id")
-            resolved_name = node_name
-            rssi = float(packet.get("rssi", -99))
-            filtered = process_zone_hysteresis(resolved_name, resolved_name, rssi)
-
-            payload = json.dumps({
-                "type": "PERIMETER_TELEMETRY",
-                "zone_data": {
-                    "lighthouse": resolved_name,
-                    "reported_node_id": reported_node_id,
-                    "raw_telemetry": packet,
-                    "state": filtered,
-                },
-                "server_time": datetime.now().isoformat(),
-            })
-
-            if visualizer_clients:
-                dead = set()
-                for c in list(visualizer_clients):
-                    try:
-                        await c.send(payload)
-                    except Exception:
-                        dead.add(c)
-                for c in dead:
-                    visualizer_clients.discard(c)
-    except serial.SerialException as exc:
-        logging.error("[ERROR] Serial %s (%s) disconnected: %s", port_path, node_name, exc)
-    finally:
-        tracked = active_serial_ports.get(node_name)
-        if ser is not None and tracked is ser:
-            active_serial_ports.pop(node_name, None)
         try:
-            if ser is not None and ser.is_open:
-                ser.close()
-        except Exception:
-            pass
+            ser = serial.Serial(port_path, HUB_SERIAL_BAUD_RATE, timeout=1)
+            active_serial_ports[node_name] = ser
+            logging.info("[BOOT] %s initialized on %s", node_name, port_path)
+            loop = asyncio.get_running_loop()
+            while True:
+                # readline() blocks; run in executor so asyncio stays responsive
+                raw_line = await loop.run_in_executor(
+                    None, lambda: ser.readline().decode("utf-8", errors="ignore").strip()
+                )
+                if not raw_line:
+                    continue
+                try:
+                    packet = json.loads(raw_line)
+                except json.JSONDecodeError:
+                    continue
+
+                # Canonical zone identity comes from the mapped serial port.
+                # This keeps room mapping stable even if a board was flashed with the wrong NODE_NAME.
+                reported_node_id = packet.get("node_id")
+                resolved_name = node_name
+                rssi = float(packet.get("rssi", -99))
+                filtered = process_zone_hysteresis(resolved_name, resolved_name, rssi)
+
+                payload = json.dumps({
+                    "type": "PERIMETER_TELEMETRY",
+                    "zone_data": {
+                        "lighthouse": resolved_name,
+                        "reported_node_id": reported_node_id,
+                        "raw_telemetry": packet,
+                        "state": filtered,
+                    },
+                    "server_time": datetime.now().isoformat(),
+                })
+
+                if visualizer_clients:
+                    dead = set()
+                    for c in list(visualizer_clients):
+                        try:
+                            await c.send(payload)
+                        except Exception:
+                            dead.add(c)
+                    for c in dead:
+                        visualizer_clients.discard(c)
+        except serial.SerialException as exc:
+            logging.error("[ERROR] Serial %s (%s) disconnected: %s", port_path, node_name, exc)
+        finally:
+            tracked = active_serial_ports.get(node_name)
+            if ser is not None and tracked is ser:
+                active_serial_ports.pop(node_name, None)
+            try:
+                if ser is not None and ser.is_open:
+                    ser.close()
+            except Exception:
+                pass
+
+        await asyncio.sleep(SERIAL_RETRY_DELAY_SECONDS)
 
 
 async def visualizer_endpoint_handler(websocket) -> None:
@@ -208,7 +246,7 @@ async def visualizer_endpoint_handler(websocket) -> None:
 
 async def main() -> None:
     logging.info("[SYSTEM] Starting UJAALLC hub — serial@%d baud, ws://0.0.0.0:8765", HUB_SERIAL_BAUD_RATE)
-    tasks = [serial_endpoint_handler(port, name) for port, name in ZONE_MAP.items()]
+    tasks = [serial_endpoint_handler(name) for name in ZONE_PORTS]
     tasks.append(websockets.serve(visualizer_endpoint_handler, "0.0.0.0", 8765))
     await asyncio.gather(*tasks)
 

@@ -7,6 +7,10 @@ ZONE_TOPOLOGY = {
         "label": "Office",
         "color": "#00FF88",  # Green - Primary Active
         "baseline_rssi": -65,
+        "motion_confirm_delta_cm": 20,
+        "motion_predator_delta_cm": 45,
+        "motion_baseline_update_delta_cm": 12,
+        "motion_rssi_margin": 5.0,
         "mount_height_ft": 5,
         "vertical_reference": {
             "above": "ZONE_UPSTAIRS",
@@ -19,6 +23,10 @@ ZONE_TOPOLOGY = {
         "label": "Garage",
         "color": "#3399FF",  # Blue - Equipment
         "baseline_rssi": -70,
+        "motion_confirm_delta_cm": 24,
+        "motion_predator_delta_cm": 52,
+        "motion_baseline_update_delta_cm": 12,
+        "motion_rssi_margin": 5.0,
         "mount_height_ft": 5,
         "vertical_reference": {
             "above": "NONE",
@@ -31,6 +39,10 @@ ZONE_TOPOLOGY = {
         "label": "Baby's Room",
         "color": "#A0A0A0",  # Gray - Baseline/Control
         "baseline_rssi": -85,
+        "motion_confirm_delta_cm": 14,
+        "motion_predator_delta_cm": 30,
+        "motion_baseline_update_delta_cm": 10,
+        "motion_rssi_margin": 4.0,
         "mount_height_ft": 5,
         "vertical_reference": {
             "above": "NONE",
@@ -43,6 +55,10 @@ ZONE_TOPOLOGY = {
         "label": "Entryway",
         "color": "#FFD700",  # Gold - Entry Monitor
         "baseline_rssi": -60,
+        "motion_confirm_delta_cm": 30,
+        "motion_predator_delta_cm": 70,
+        "motion_baseline_update_delta_cm": 15,
+        "motion_rssi_margin": 7.0,
         "mount_height_ft": 5,
         "vertical_reference": {
             "above": "NONE",

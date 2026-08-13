@@ -45,15 +45,24 @@ def build_node_state(node_id: str) -> dict:
     "zone_id": meta.get("zone_id", node_id),
     "color": meta.get("color", "#39ff14"),
     "baseline_rssi": meta.get("baseline_rssi", -70),
+    "motion_confirm_delta_cm": meta.get("motion_confirm_delta_cm", 20),
+    "motion_predator_delta_cm": meta.get("motion_predator_delta_cm", 45),
+    "motion_baseline_update_delta_cm": meta.get("motion_baseline_update_delta_cm", 12),
+    "motion_rssi_margin": meta.get("motion_rssi_margin", 5.0),
     "motion": False,
     "motion_label": "CLEAR",
     "motion_intensity": "idle",
     "rssi": None,
     "strength": 0,
     "distance_cm": None,
+    "distance_baseline_cm": None,
+    "distance_baseline_samples": 0,
     "mic_rms": None,
     "sensor_status": "UNKNOWN",
     "sensor_ok": False,
+    "audio_ready": False,
+    "last_audio_cmd": "NONE",
+    "last_audio_cmd_ms": 0,
     "last_seen": None,
     "source": "Awaiting telemetry",
     "siren_on": False,
@@ -147,13 +156,39 @@ def update_motion_state(node: dict, packet: dict) -> None:
   motion_active = state.get("state") == "HOLD"
   motion_label = "CLEAR"
 
-  # Primary confirmation path from TF-Luna distance.
-  # 20ft sphere is approximately 610cm.
+  confirm_delta_cm = float(node.get("motion_confirm_delta_cm", 20))
+  predator_delta_cm = float(node.get("motion_predator_delta_cm", 45))
+  baseline_update_delta_cm = float(node.get("motion_baseline_update_delta_cm", 12))
+  rssi_margin = float(node.get("motion_rssi_margin", 5.0))
+
+  baseline_distance = node.get("distance_baseline_cm")
+  baseline_samples = int(node.get("distance_baseline_samples") or 0)
+  distance_delta = None
+
   if has_valid_distance:
-    if distance_value <= 150:
+    if baseline_distance is None:
+      baseline_distance = float(distance_value)
+      baseline_samples = 1
+    else:
+      distance_delta = abs(float(distance_value) - float(baseline_distance))
+      if distance_delta <= baseline_update_delta_cm:
+        baseline_distance = (float(baseline_distance) * 0.85) + (float(distance_value) * 0.15)
+        baseline_samples = min(baseline_samples + 1, 1000)
+    node["distance_baseline_cm"] = round(float(baseline_distance), 1)
+    node["distance_baseline_samples"] = baseline_samples
+  else:
+    node["distance_baseline_samples"] = baseline_samples
+
+  # Primary confirmation path from TF-Luna distance.
+  # Treat a steady return as background. Only distance changes away from the
+  # learned baseline should enlarge the sphere, otherwise nearby furniture/walls
+  # can look like a permanent predator.
+  if has_valid_distance and baseline_distance is not None and baseline_samples >= 5:
+    distance_delta = abs(float(distance_value) - float(baseline_distance))
+    if distance_delta >= predator_delta_cm:
       motion_label = "PREDATOR_DETECTED"
       motion_active = True
-    elif distance_value <= 610:
+    elif distance_delta >= confirm_delta_cm:
       motion_label = "CONFIRMING_TARGET"
       motion_active = True
 
@@ -165,7 +200,7 @@ def update_motion_state(node: dict, packet: dict) -> None:
     motion_label = "SENSOR_ERR"
 
   if not motion_active and rssi_value is not None:
-    motion_active = rssi_value >= float(node["baseline_rssi"]) + 5.0
+    motion_active = rssi_value >= float(node["baseline_rssi"]) + rssi_margin
     if motion_active and motion_label == "CLEAR":
       motion_label = "CONFIRMING_TARGET"
 
@@ -191,6 +226,12 @@ def update_motion_state(node: dict, packet: dict) -> None:
   node["mic_rms"] = mic_rms_value
   node["sensor_status"] = sensor_status
   node["sensor_ok"] = sensor_ok
+  node["audio_ready"] = bool(raw.get("audio_ready", False))
+  node["last_audio_cmd"] = str(raw.get("last_audio_cmd", "NONE"))
+  try:
+    node["last_audio_cmd_ms"] = int(raw.get("last_audio_cmd_ms", 0) or 0)
+  except (TypeError, ValueError):
+    node["last_audio_cmd_ms"] = 0
   node["last_seen"] = datetime.now().isoformat()
   node["source"] = zone_data.get("lighthouse") or raw.get("node_name") or raw.get("node_id") or "unknown"
   node["last_packet"] = packet
@@ -231,9 +272,32 @@ def toggle_node_feature(node_id: str, feature: str, enabled: bool | None = None)
   key = f"{feature}_on"
   next_value = not bool(node[key]) if enabled is None else bool(enabled)
   node[key] = next_value
-  node["last_seen"] = datetime.now().isoformat()
   dashboard_state["updated_at"] = datetime.now().isoformat()
   return node
+
+
+async def clear_node_feature_after(node_id: str, feature: str, delay_seconds: float) -> None:
+  await asyncio.sleep(delay_seconds)
+  node = get_node_state(node_id)
+  if node is None:
+    return
+  key = f"{feature}_on"
+  if not node.get(key):
+    return
+  node[key] = False
+  dashboard_state["updated_at"] = datetime.now().isoformat()
+  await broadcast_state(f"{node_id} {feature} reset")
+
+
+def node_is_online(node: dict, max_age_seconds: int = 10) -> bool:
+  last_seen = node.get("last_seen")
+  if not last_seen:
+    return False
+  try:
+    age = datetime.now() - datetime.fromisoformat(last_seen)
+  except Exception:
+    return False
+  return age.total_seconds() <= max_age_seconds
 
 
 async def send_hub_command(payload: dict) -> bool:
@@ -294,12 +358,12 @@ HTML_PAGE = """
     .dashboard-grid { display:grid; flex:1; min-height:0; grid-template-columns:minmax(0,70%) minmax(280px,30%); gap:10px; align-items:stretch; }
     .stack { display:grid; min-height:0; grid-template-rows:auto minmax(0,70%) minmax(0,30%); gap:10px; }
     .scene, .card, .status-card, .node-control { border:1px solid var(--panel-border); border-radius:18px; box-shadow:var(--shadow); background:linear-gradient(180deg, rgba(10,18,14,.96), rgba(6,10,8,.96)); backdrop-filter:blur(10px); }
-    .scene { position:relative; min-height:0; overflow:hidden; background: radial-gradient(circle at top, rgba(57,255,20,.10), transparent 34%), linear-gradient(180deg, rgba(8,14,11,.98), rgba(3,6,5,.98)); }
+    .scene { position:relative; min-height:0; overflow:hidden; display:flex; flex-direction:column; background: radial-gradient(circle at top, rgba(57,255,20,.10), transparent 34%), linear-gradient(180deg, rgba(8,14,11,.98), rgba(3,6,5,.98)); }
     .scene-header { display:flex; justify-content:space-between; gap:8px; padding:10px 12px 8px; }
     .scene-header h2, .card h3, .status-card h3, .node-control h4 { margin:0; text-transform:uppercase; letter-spacing:.12em; }
     .scene-header h2 { font-size:.9rem; color:var(--cyan); }
     .scene-header .hint, .status-card p, .node-meta, .control-button small { color:var(--muted); }
-    #canvas-container { width:100%; height:calc(100% - 66px); }
+    #canvas-container { width:100%; flex:1; min-height:220px; }
     .status { display:inline-flex; align-items:center; gap:.5rem; color:var(--neon); font-size:.85rem; letter-spacing:.06em; text-transform:uppercase; margin-bottom:0; }
     .status::before { content:"●"; color:var(--cyan); text-shadow:0 0 10px var(--cyan); }
     .control-panel { display:grid; align-content:start; gap:8px; min-height:0; overflow:auto; padding-right:2px; }
@@ -325,7 +389,7 @@ HTML_PAGE = """
     th { color:var(--amber); font-size:.64rem; letter-spacing:.10em; text-transform:uppercase; }
     tbody tr:hover { background:rgba(57,255,20,.06); }
     pre { margin:0; white-space:pre-wrap; word-break:break-word; font-size:.70rem; line-height:1.28; color:#d8ffe0; max-height:110px; overflow:auto; }
-    #nodeCardBar { display:flex; gap:6px; justify-content:center; padding:6px 6px 10px; flex-wrap:wrap; }
+    #nodeCardBar { display:flex; gap:6px; justify-content:center; align-items:stretch; flex-wrap:wrap; padding:6px 6px 10px; max-height:84px; overflow:auto; }
     .node-card { background:rgba(18,26,38,.88); border:1px solid #1e2d42; border-top:2px solid #00f0ff; border-radius:6px; padding:5px 7px; min-width:98px; backdrop-filter:blur(8px); }
     .card-id { font-weight:bold; font-size:.68rem; color:#fff; letter-spacing:.05em; }
     .card-zone { font-size:.57rem; text-transform:uppercase; color:#00f0ff; letter-spacing:.3px; margin-bottom:2px; }
@@ -341,6 +405,7 @@ HTML_PAGE = """
       .stack { grid-template-rows:auto minmax(420px,70vh) auto; }
       .control-panel { overflow:visible; }
       .telemetry-grid { grid-template-columns:1fr; }
+      #nodeCardBar { max-height:none; }
     }
     @media (max-width: 720px) { html { font-size: 15px; } .shell { padding:10px; } }
   </style>
@@ -381,10 +446,10 @@ HTML_PAGE = """
     const SENSOR_HEIGHT = 5; // 5-foot tripod mount
     
     const ROOMS = {
-      "FSS-N01": { id: "FSS-N01", name: "OFFICE",      center: [-10, 0, -10], color: 0x00f0ff },
-      "FSS-N02": { id: "FSS-N02", name: "GARAGE",      center: [10, 0, -10],  color: 0xff9900 },
-      "FSS-N03": { id: "FSS-N03", name: "BABY'S ROOM", center: [-10, 0, 10],  color: 0xff0055 },
-      "FSS-N04": { id: "FSS-N04", name: "ENTRYWAY",    center: [10, 0, 10],   color: 0x7b00ff }
+      "FSS-N01": { id: "FSS-N01", name: "OFFICE",      center: [-10, 0, -10], color: 0x00ff88 },
+      "FSS-N02": { id: "FSS-N02", name: "GARAGE",      center: [10, 0, -10],  color: 0x3399ff },
+      "FSS-N03": { id: "FSS-N03", name: "BABY'S ROOM", center: [-10, 0, 10],  color: 0xa0a0a0 },
+      "FSS-N04": { id: "FSS-N04", name: "ENTRYWAY",    center: [10, 0, 10],   color: 0xffd700 }
     };
     
     let scene, camera, renderer, orbitControls;
@@ -392,6 +457,7 @@ HTML_PAGE = """
     const animatedSpheres = [];
     const nodeSpheres = {};
     const lastNodeVisualState = {};
+    const lastAlertBeepAt = {};
     const speakerNodes = [
       { id: 'FSS-N01', zone: 'Office' },
       { id: 'FSS-N02', zone: 'Garage' },
@@ -488,6 +554,31 @@ HTML_PAGE = """
       const sphere = nodeSpheres[nodeId];
       if (!sphere) return;
       sphere.userData.highlightUntil = Date.now() + 520;
+    }
+
+    function pulseControlVisual(nodeId, feature = 'ping', enabled = true) {
+      const room = ROOMS[nodeId];
+      if (!room) return;
+
+      const now = Date.now();
+      if (room.phaseBox) {
+        room.phaseBox.userData.mode = feature === 'siren' && enabled ? 'PREDATOR_DETECTED' : 'CONTROL_ACTIVE';
+        room.phaseBox.userData.alertUntil = now + (feature === 'ping' ? 900 : 2200);
+        room.phaseBox.userData.controlColor = room.color;
+        room.phaseBox.scale.set(
+          feature === 'siren' && enabled ? 1.45 : 1.16,
+          feature === 'siren' && enabled ? 1.9 : 1.2,
+          feature === 'siren' && enabled ? 1.45 : 1.16,
+        );
+      }
+
+      const sphere = nodeSpheres[nodeId];
+      if (sphere) {
+        sphere.userData.controlUntil = now + (feature === 'ping' ? 900 : 2200);
+        sphere.userData.controlFeature = feature;
+        sphere.userData.controlEnabled = enabled;
+        sphere.userData.highlightUntil = now + (feature === 'ping' ? 900 : 1400);
+      }
     }
 
     function isSocketOpen() {
@@ -720,7 +811,13 @@ HTML_PAGE = """
         const t = (alertUntil - nowMs) / 1000;
         const blink = 0.35 + Math.abs(Math.sin(animTime * 4.3)) * 0.55;
         box.material.opacity = Math.min(0.85, blink * (0.55 + Math.max(0, t) * 0.1));
-        box.material.color.setHex(box.userData.mode === 'PREDATOR_DETECTED' ? 0xff3b30 : 0xffb347);
+        if (box.userData.mode === 'PREDATOR_DETECTED') {
+          box.material.color.setHex(0xff3b30);
+        } else if (box.userData.mode === 'CONTROL_ACTIVE') {
+          box.material.color.setHex(box.userData.controlColor || 0xffb347);
+        } else {
+          box.material.color.setHex(0xffb347);
+        }
       });
 
       orbitControls.update();
@@ -762,9 +859,21 @@ HTML_PAGE = """
       const isActive = Boolean(node.motion);
       const isConfirming = node.motion_label === 'CONFIRMING_TARGET';
       const isPredator = node.motion_label === 'PREDATOR_DETECTED';
+      const controlActive = sphere.userData.controlUntil && Date.now() < sphere.userData.controlUntil;
+      const sirenActive = Boolean(node.siren_on);
+      const intercomActive = Boolean(node.intercom_on);
 
       sphere.material.color.setHex(baseColor);
-      if (isPredator) {
+      if (controlActive && sirenActive) {
+        sphere.material.opacity = 0.48;
+        sphere.userData.dynamicScale = 1.56;
+      } else if (controlActive && intercomActive) {
+        sphere.material.opacity = 0.34;
+        sphere.userData.dynamicScale = 1.32;
+      } else if (controlActive) {
+        sphere.material.opacity = 0.28;
+        sphere.userData.dynamicScale = 1.22;
+      } else if (isPredator) {
         sphere.material.opacity = 0.42;
         sphere.userData.dynamicScale = 1.48;
       } else if (isConfirming) {
@@ -782,7 +891,7 @@ HTML_PAGE = """
       }
 
       if (pointLight) {
-        pointLight.intensity = isPredator ? 2.9 : isConfirming ? 2.1 : (hasFreshData ? 0.9 : 0.35);
+        pointLight.intensity = controlActive ? (sirenActive ? 3.2 : 2.0) : isPredator ? 2.9 : isConfirming ? 2.1 : (hasFreshData ? 0.9 : 0.35);
       }
     }
     
@@ -822,6 +931,7 @@ HTML_PAGE = """
         controlStateEl.textContent = 'Dashboard socket not connected';
         return;
       }
+      pulseControlVisual(nodeId, feature, Boolean(enabled));
       socket.send(JSON.stringify({ type: 'control_command', nodeId, feature, enabled }));
       controlStateEl.textContent = `${nodeId} ${feature} command sent`;
     }
@@ -860,8 +970,15 @@ HTML_PAGE = """
             sendControl(node.node_id, 'intercom', !Boolean(current?.intercom_on));
           });
 
+          const pingButton = document.createElement('button');
+          pingButton.className = 'control-button';
+          pingButton.addEventListener('click', () => {
+            sendControl(node.node_id, 'ping', true);
+          });
+
           controls.appendChild(sirenButton);
           controls.appendChild(intercomButton);
+          controls.appendChild(pingButton);
           nodeControl.appendChild(title);
           nodeControl.appendChild(meta);
           nodeControl.appendChild(controls);
@@ -880,7 +997,7 @@ HTML_PAGE = """
           row.appendChild(colLast);
           rowsEl.appendChild(row);
 
-          nodeControlBindings[node.node_id] = { nodeControl, pill, source, sirenButton, intercomButton, state: null };
+          nodeControlBindings[node.node_id] = { nodeControl, pill, source, sirenButton, intercomButton, pingButton, state: null };
           nodeRowBindings[node.node_id] = { colNode, colMotion, colSignal, colState, colLast };
         }
       }
@@ -892,13 +1009,28 @@ HTML_PAGE = """
 
       ui.state = node;
       ui.pill.textContent = node.motion_label;
-      ui.source.textContent = node.source;
+      const audioStamp = node.last_audio_cmd && node.last_audio_cmd !== 'NONE'
+        ? `audio:${node.last_audio_cmd}`
+        : 'audio:none';
+      ui.source.textContent = `${node.source} · ${audioStamp}`;
 
-      ui.sirenButton.dataset.active = String(Boolean(node.siren_on));
-      ui.sirenButton.innerHTML = `${node.siren_on ? 'Siren On' : 'Siren Off'}<small>Audible alarm for ${node.label}. Starts silenced.</small>`;
+      const lastSeenMs = node.last_seen ? new Date(node.last_seen).getTime() : 0;
+      const online = Boolean(lastSeenMs) && (Date.now() - lastSeenMs) <= 10000;
 
-      ui.intercomButton.dataset.active = String(Boolean(node.intercom_on));
-      ui.intercomButton.innerHTML = `${node.intercom_on ? 'Intercom On' : 'Intercom Off'}<small>Two-way talkback for ${node.label}.</small>`;
+      ui.sirenButton.disabled = !online;
+      ui.intercomButton.disabled = !online;
+      ui.pingButton.disabled = !online;
+
+      const sirenState = online ? Boolean(node.siren_on) : false;
+      ui.sirenButton.dataset.active = String(sirenState);
+      ui.sirenButton.innerHTML = `${sirenState ? 'Siren On' : 'Siren Off'}<small>${online ? `Audible alarm for ${node.label}. Starts silenced.` : 'Offline: no recent telemetry'}</small>`;
+
+      const intercomState = online ? Boolean(node.intercom_on) : false;
+      ui.intercomButton.dataset.active = String(intercomState);
+      ui.intercomButton.innerHTML = `${intercomState ? 'Intercom On' : 'Intercom Off'}<small>${online ? `Two-way talkback for ${node.label}.` : 'Offline: no recent telemetry'}</small>`;
+
+      ui.pingButton.dataset.active = 'false';
+      ui.pingButton.innerHTML = `Quiet Ping<small>${online ? `Low-volume wiring check for ${node.label}.` : 'Offline: no recent telemetry'}</small>`;
     }
 
     function updateNodeRow(node) {
@@ -907,8 +1039,12 @@ HTML_PAGE = """
 
       row.colNode.textContent = node.node_id;
       row.colMotion.textContent = node.motion_label;
-      row.colSignal.textContent = node.distance_cm != null && node.distance_cm >= 0 ? `${node.distance_cm} cm` : (node.rssi ?? 'n/a');
-      row.colState.textContent = node.motion ? 'MOTION' : (node.sensor_status || 'CLEAR');
+      row.colSignal.textContent = node.distance_cm != null && node.distance_cm >= 0
+        ? `${node.distance_cm} cm`
+        : (node.rssi ?? 'n/a');
+      const cmd = node.last_audio_cmd && node.last_audio_cmd !== 'NONE' ? node.last_audio_cmd : '-';
+      const audio = node.audio_ready ? 'AUDIO_OK' : 'AUDIO_OFF';
+      row.colState.textContent = `${node.sensor_status || 'CLEAR'} · ${audio} · ${cmd}`;
       row.colLast.textContent = formatAgo(node.last_seen);
     }
 
@@ -928,8 +1064,13 @@ HTML_PAGE = """
 
         if (enteredAlert) {
           triggerPhaseTracer(node.node_id, node.motion_label);
-          const alertHz = node.motion_label === 'PREDATOR_DETECTED' ? 1240 : 920;
-          playAlertBeep(alertHz, 220).catch(() => {});
+          const nowMs = Date.now();
+          const lastBeep = lastAlertBeepAt[node.node_id] || 0;
+          if ((nowMs - lastBeep) >= 3500) {
+            const alertHz = node.motion_label === 'PREDATOR_DETECTED' ? 1240 : 920;
+            playAlertBeep(alertHz, 220).catch(() => {});
+            lastAlertBeepAt[node.node_id] = nowMs;
+          }
         }
 
         lastNodeVisualState[node.node_id] = node.motion_label;
@@ -1034,6 +1175,40 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
             node_id = message.get("nodeId")
             feature = message.get("feature")
             enabled = message.get("enabled")
+
+            existing = get_node_state(node_id)
+            if existing is None:
+              await websocket.send_text(json.dumps({
+                "type": "control_ack",
+                "message": f"Ignored {feature} command for {node_id}",
+              }))
+              continue
+
+            if feature in {"siren", "intercom", "ping"} and not node_is_online(existing):
+              await websocket.send_text(json.dumps({
+                "type": "control_ack",
+                "message": f"{node_id} is offline (no recent telemetry). Command blocked.",
+              }))
+              await broadcast_state(f"{node_id} offline: {feature} not sent")
+              continue
+
+            if feature == "ping":
+              audio_payload = {
+                "event": "node_audio_command",
+                "node_id": node_id,
+                "feature": "ping",
+                "enabled": True,
+                "issued_at": datetime.now().isoformat(),
+              }
+              ok = await send_hub_command(audio_payload)
+              await websocket.send_text(json.dumps({
+                "type": "control_ack",
+                "message": f"{node_id} quiet ping {'sent' if ok else 'failed'}",
+              }))
+              if ok:
+                await broadcast_state(f"{node_id} ping sent")
+              continue
+
             updated_node = toggle_node_feature(node_id, feature, enabled)
             if updated_node is None:
                 await websocket.send_text(json.dumps({
@@ -1056,6 +1231,9 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 "issued_at": datetime.now().isoformat(),
               }
               await send_hub_command(audio_payload)
+              if bool(updated_node[f"{feature}_on"]):
+                reset_delay = 2.6 if feature == "siren" else 1.2
+                asyncio.create_task(clear_node_feature_after(node_id, feature, reset_delay))
 
             await broadcast_state(f"{node_id} {feature} updated")
     except WebSocketDisconnect:
