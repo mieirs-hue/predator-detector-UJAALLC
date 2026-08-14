@@ -17,11 +17,11 @@ if [[ ! -x "$PIO_BIN" ]]; then
   fi
 fi
 
-declare -A NODE_PORT=(
-  [FSS-N01]="/dev/serial/by-id/usb-Arduino_NanoESP32_28848546D968-if01"
-  [FSS-N02]="/dev/serial/by-id/usb-Arduino_NanoESP32_28848546D8CC-if01"
-  [FSS-N03]="/dev/serial/by-id/usb-Arduino_NanoESP32_E072A1CED858-if01"
-  [FSS-N04]="/dev/serial/by-id/usb-Arduino_NanoESP32_E072A1F0A348-if01"
+declare -A NODE_PORT_CANDIDATES=(
+  [FSS-N01]="/dev/serial/by-id/usb-Arduino_NanoESP32_28848546D968-if01 /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:84:85:46:D9:68-if00 /dev/ttyACM0"
+  [FSS-N02]="/dev/serial/by-id/usb-Arduino_NanoESP32_28848546D8CC-if01 /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_28:84:85:46:D8:CC-if00 /dev/ttyACM1"
+  [FSS-N03]="/dev/serial/by-id/usb-Arduino_NanoESP32_E072A1CED858-if01 /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_E0:72:A1:CE:D8:58-if00 /dev/ttyACM2"
+  [FSS-N04]="/dev/serial/by-id/usb-Arduino_NanoESP32_E072A1F0A348-if01 /dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_E0:72:A1:F0:A3:48-if00 /dev/ttyACM3"
 )
 
 declare -A NODE_ENV=(
@@ -45,6 +45,18 @@ Notes:
   - Without --yes, the script only prints intended actions.
   - Uses stable /dev/serial/by-id paths to avoid tty reordering issues.
 EOF
+}
+
+resolve_node_port() {
+  local node="$1"
+  local candidate
+  for candidate in ${NODE_PORT_CANDIDATES[$node]}; do
+    if [[ -e "$candidate" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+  return 1
 }
 
 CONFIRM=0
@@ -88,9 +100,9 @@ echo "PIO binary: $PIO_BIN"
 echo "Target nodes: ${NODES[*]}"
 
 for node in "${NODES[@]}"; do
-  port="${NODE_PORT[$node]}"
-  if [[ ! -e "$port" ]]; then
-    echo "ERROR: Missing port for $node: $port" >&2
+  port="$(resolve_node_port "$node" || true)"
+  if [[ -z "$port" ]]; then
+    echo "ERROR: Missing port for $node. Tried: ${NODE_PORT_CANDIDATES[$node]}" >&2
     exit 1
   fi
   echo "Mapped $node -> $port"
@@ -105,7 +117,7 @@ fi
 
 echo
 for node in "${NODES[@]}"; do
-  port="${NODE_PORT[$node]}"
+  port="$(resolve_node_port "$node")"
   env_name="${NODE_ENV[$node]}"
   echo "Flashing $node using env $env_name on $port"
   "$PIO_BIN" run -d "$FW_DIR" -e "$env_name" -t upload --upload-port "$port"

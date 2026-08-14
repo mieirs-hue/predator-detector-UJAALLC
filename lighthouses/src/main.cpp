@@ -175,8 +175,10 @@ void handleAudioCommand(const String& command) {
     last_audio_cmd_ms = millis();
 
     if (command == "PING") {
-        // Quiet heartbeat ping for wiring/label validation.
-        playTone(1000, 50, 0.10f);
+        // Detection notification ping (audible but shorter than siren).
+        playTone(1100, 120, 0.55f);
+        delay(40);
+        playTone(900, 120, 0.55f);
         return;
     }
 

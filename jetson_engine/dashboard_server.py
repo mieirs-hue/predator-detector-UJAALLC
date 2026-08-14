@@ -67,6 +67,9 @@ def build_node_state(node_id: str) -> dict:
     "source": "Awaiting telemetry",
     "siren_on": False,
     "intercom_on": False,
+    "siren_manual_off_latch": False,
+    "intercom_manual_off_latch": False,
+    "auto_alert_engaged": False,
     "last_packet": None,
   }
 
@@ -75,6 +78,7 @@ def build_initial_state() -> dict:
   return {
     "type": "dashboard_state",
     "updated_at": None,
+    "operation_mode": "FULLY_INTERACTIVE",
     "hub": {
       "connected": False,
       "last_seen": None,
@@ -87,6 +91,16 @@ def build_initial_state() -> dict:
 
 dashboard_clients: Set[WebSocket] = set()
 dashboard_state: dict = build_initial_state()
+
+
+def set_operation_mode(mode: str) -> dict | None:
+  normalized = str(mode).upper()
+  if normalized not in {"FULLY_INTERACTIVE", "FULLY_AUTOMATIC"}:
+    return None
+
+  dashboard_state["operation_mode"] = normalized
+  dashboard_state["updated_at"] = datetime.now().isoformat()
+  return dashboard_state
 
 
 def get_node_state(node_id: str) -> dict | None:
@@ -212,6 +226,25 @@ def update_motion_state(node: dict, packet: dict) -> None:
   if not motion_active and motion_label not in {"SENSOR_ERR", "UNKNOWN"}:
     motion_label = "CLEAR"
 
+  if motion_label != "PREDATOR_DETECTED":
+    node["siren_manual_off_latch"] = False
+    node["intercom_manual_off_latch"] = False
+
+  operation_mode = str(dashboard_state.get("operation_mode", "FULLY_INTERACTIVE")).upper()
+  if operation_mode == "FULLY_AUTOMATIC" and motion_label == "PREDATOR_DETECTED":
+    auto_raised = False
+    if not node.get("siren_on") and not node.get("siren_manual_off_latch"):
+      node["siren_on"] = True
+      auto_raised = True
+    if not node.get("intercom_on") and not node.get("intercom_manual_off_latch"):
+      node["intercom_on"] = True
+      auto_raised = True
+    node["auto_alert_engaged"] = bool(node.get("auto_alert_engaged")) or auto_raised
+  elif node.get("auto_alert_engaged") and motion_label != "PREDATOR_DETECTED":
+    node["siren_on"] = False
+    node["intercom_on"] = False
+    node["auto_alert_engaged"] = False
+
   node["motion"] = motion_active
   node["motion_label"] = motion_label
   node["motion_intensity"] = (
@@ -272,6 +305,10 @@ def toggle_node_feature(node_id: str, feature: str, enabled: bool | None = None)
   key = f"{feature}_on"
   next_value = not bool(node[key]) if enabled is None else bool(enabled)
   node[key] = next_value
+  latch_key = f"{feature}_manual_off_latch"
+  node[latch_key] = not next_value
+  if next_value:
+    node["auto_alert_engaged"] = False
   dashboard_state["updated_at"] = datetime.now().isoformat()
   return node
 
@@ -298,6 +335,16 @@ def node_is_online(node: dict, max_age_seconds: int = 10) -> bool:
   except Exception:
     return False
   return age.total_seconds() <= max_age_seconds
+
+
+def stage_label_for_motion(motion_label: str) -> str:
+  if motion_label == "PREDATOR_DETECTED":
+    return "PREDATOR DETECTED"
+  if motion_label == "CONFIRMING_TARGET":
+    return "MONITORING CONFIRMING TARGET"
+  if motion_label == "SENSOR_ERR":
+    return "SENSOR ERROR"
+  return "MONITORING CLEAR"
 
 
 async def send_hub_command(payload: dict) -> bool:
@@ -375,6 +422,12 @@ HTML_PAGE = """
     .status-card, .card, .node-control { padding:8px; }
     .status-card h3, .card h3 { color:var(--cyan); font-size:.74rem; }
     .status-card p { margin:3px 0 0; line-height:1.25; font-size:.66rem; }
+    .mode-switcher { display:grid; gap:6px; border:1px solid rgba(68,215,255,.28); border-radius:10px; background:rgba(8,18,14,.82); padding:8px; }
+    .mode-switcher-title { margin:0; color:var(--amber); letter-spacing:.10em; text-transform:uppercase; font-size:.72rem; }
+    .mode-switcher-actions { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+    .mode-button { appearance:none; border:1px solid rgba(57,255,20,.24); background:linear-gradient(180deg, rgba(18,31,22,.96), rgba(8,12,10,.98)); color:var(--text); border-radius:10px; padding:8px 9px; font-family:inherit; font-size:.68rem; letter-spacing:.08em; text-transform:uppercase; text-align:left; cursor:pointer; }
+    .mode-button[data-active="true"] { border-color:rgba(68,215,255,.88); background:linear-gradient(180deg, rgba(68,215,255,.16), rgba(8,12,10,.98)); box-shadow:0 0 0 1px rgba(68,215,255,.16), 0 0 18px rgba(68,215,255,.14); }
+    .mode-readout { color:var(--muted); font-size:.68rem; line-height:1.25; }
     .control-readout { display:grid; gap:3px; margin-bottom:6px; padding:7px; border-radius:9px; border:1px solid rgba(68,215,255,.18); background:rgba(8,14,11,.74); }
     .control-readout strong { color:var(--amber); letter-spacing:.08em; text-transform:uppercase; font-size:.66rem; }
     .control-grid { display:grid; gap:6px; }
@@ -383,6 +436,9 @@ HTML_PAGE = """
     .node-pill { padding:2px 6px; border-radius:999px; border:1px solid rgba(68,215,255,.24); color:var(--cyan); text-transform:uppercase; letter-spacing:.08em; font-size:.62rem; }
     .control-button { appearance:none; width:100%; border:1px solid rgba(57,255,20,.28); background:linear-gradient(180deg, rgba(18,31,22,.96), rgba(8,12,10,.98)); color:var(--text); border-radius:10px; padding:8px 9px; font-family:inherit; font-size:.73rem; letter-spacing:.06em; text-transform:uppercase; text-align:left; cursor:pointer; }
     .control-button[data-active="true"] { border-color:rgba(57,255,20,.85); background:linear-gradient(180deg, rgba(57,255,20,.18), rgba(8,12,10,.98)); box-shadow:0 0 0 1px rgba(57,255,20,.20), 0 0 22px rgba(57,255,20,.16); }
+    .guard-siren-button { appearance:none; width:100%; min-height:72px; border:1px solid rgba(255,193,7,.80); background:linear-gradient(180deg, rgba(255,213,79,.98), rgba(255,170,0,.92)); color:#231500; border-radius:14px; padding:12px 12px; font-family:inherit; font-size:.90rem; font-weight:800; letter-spacing:.08em; text-transform:uppercase; text-align:left; cursor:pointer; box-shadow:0 0 0 1px rgba(255,193,7,.28), 0 0 24px rgba(255,193,7,.18); }
+    .guard-siren-button[data-active="true"] { border-color:rgba(57,255,20,.82); background:linear-gradient(180deg, rgba(57,255,20,.92), rgba(23,164,71,.92)); color:#071006; box-shadow:0 0 0 1px rgba(57,255,20,.24), 0 0 30px rgba(57,255,20,.20); }
+    .guard-siren-button small { display:block; margin-top:4px; font-size:.62rem; font-weight:700; letter-spacing:.05em; text-transform:none; opacity:.92; }
     .card { margin-bottom:0; }
     table { width:100%; border-collapse:collapse; font-size:.78rem; }
     th, td { text-align:left; padding:6px 6px; border-bottom:1px solid rgba(57,255,20,.14); }
@@ -421,17 +477,23 @@ HTML_PAGE = """
           <div id=\"canvas-container\"></div>          <div id="nodeCardBar"></div>        </div>
         <div class=\"telemetry-grid\">
           <div class=\"card\"><h3>Node Status</h3><table><thead><tr><th>Node</th><th>Motion</th><th>Signal</th><th>State</th><th>Last</th></tr></thead><tbody id=\"rows\"></tbody></table></div>
-          <div class=\"card\"><h3>Latest Packet</h3><pre id=\"latest\">Waiting for telemetry…</pre></div>
         </div>
       </div>
       <div class=\"control-panel\">
-        <div class=\"status-card\"><h3>* System Controls</h3><p>* Compact mode enabled. Confirming-target uses TF-Luna distance first and RSSI fallback when sensors are degraded.</p></div>
+        <div class=\"status-card\"><h3>System Controls</h3><p>Confirming-target uses TF-Luna distance first and RSSI fallback when sensors are degraded.</p></div>
+        <div class="mode-switcher">
+          <div class="mode-switcher-title">Operating Mode</div>
+          <div class="mode-switcher-actions">
+            <button id="btn-mode-interactive" class="mode-button" type="button">Blue: Acoustic Subsystem</button>
+            <button id="btn-mode-automatic" class="mode-button" type="button">Green: Actions Automatic</button>
+          </div>
+          <div id="dashboardMode" class="mode-readout">Mode: Blue acoustic standby</div>
+        </div>
         <div class=\"speaker-control-panel\">
           <div class=\"speaker-control-title\">Acoustic Subsystem</div>
-          <button id=\"btn-siren-test\" class=\"speaker-test-button\" type=\"button\">Cycle Speaker Check (0.5s)</button>
-          <div id=\"speaker-status\" class=\"speaker-status\">Ready to test (click to cycle nodes)</div>
+          <button id="btn-siren-test" class="speaker-test-button" type="button">Blue Button: Cycle Beep</button>
+          <div id="speaker-status" class="speaker-status">Blue button cycles a beep</div>
         </div>
-        <div class=\"card\"><h3>Command State</h3><div class=\"control-readout\"><strong>Dashboard</strong><span id=\"controlState\">Idle</span></div><div class=\"control-readout\"><strong>Broadcast</strong><span id=\"broadcastState\">No commands sent yet</span></div></div>
         <div class=\"control-grid\" id=\"controlPanel\"></div>
       </div>
     </div>
@@ -457,11 +519,10 @@ HTML_PAGE = """
     const animatedSpheres = [];
     const nodeSpheres = {};
     const lastNodeVisualState = {};
+    const lastDashboardPingAt = {};
     const speakerNodes = [
       { id: 'FSS-N01', zone: 'Office' },
       { id: 'FSS-N02', zone: 'Garage' },
-      { id: 'FSS-N03', zone: "Baby\'s Room" },
-      { id: 'FSS-N04', zone: 'Entryway' },
     ];
     let latestDashboardState = null;
     let audioContext = null;
@@ -503,6 +564,39 @@ HTML_PAGE = """
       gain.connect(ctx.destination);
       osc.start(now);
       osc.stop(now + duration);
+    }
+
+    async function playDashboardQuietPing() {
+      const ctx = getAudioContext();
+      if (!ctx) return;
+      if (ctx.state === 'suspended') {
+        try {
+          await ctx.resume();
+        } catch (error) {
+          return;
+        }
+      }
+
+      const now = ctx.currentTime;
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.linearRampToValueAtTime(0.08, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.34);
+      gain.connect(ctx.destination);
+
+      const toneA = ctx.createOscillator();
+      toneA.type = 'sine';
+      toneA.frequency.setValueAtTime(1020, now);
+      toneA.connect(gain);
+      toneA.start(now);
+      toneA.stop(now + 0.11);
+
+      const toneB = ctx.createOscillator();
+      toneB.type = 'sine';
+      toneB.frequency.setValueAtTime(860, now + 0.15);
+      toneB.connect(gain);
+      toneB.start(now + 0.15);
+      toneB.stop(now + 0.30);
     }
 
     function triggerPhaseTracer(nodeId, mode = 'CONFIRMING_TARGET') {
@@ -870,13 +964,44 @@ HTML_PAGE = """
     const socket = new WebSocket(`${protocol}://${location.host}/ws/dashboard`);
     const statusEl = document.getElementById('status');
     const rowsEl = document.getElementById('rows');
-    const latestEl = document.getElementById('latest');
     const controlPanelEl = document.getElementById('controlPanel');
-    const controlStateEl = document.getElementById('controlState');
-    const broadcastStateEl = document.getElementById('broadcastState');
+    const dashboardModeEl = document.getElementById('dashboardMode');
+    const modeInteractiveButton = document.getElementById('btn-mode-interactive');
+    const modeAutomaticButton = document.getElementById('btn-mode-automatic');
     const sirenTestButton = document.getElementById('btn-siren-test');
     const nodeControlBindings = {};
     const nodeRowBindings = {};
+
+    function normalizeModeLabel(mode) {
+      return String(mode || 'FULLY_INTERACTIVE').replace(/_/g, ' ');
+    }
+
+    function formatMotionLabel(label) {
+      if (label === 'PREDATOR_DETECTED') return 'PREDATOR DETECTED';
+      if (label === 'CONFIRMING_TARGET') return 'MONITORING CONFIRMING TARGET';
+      if (label === 'SENSOR_ERR') return 'SENSOR ERROR';
+      return 'MONITORING CLEAR';
+    }
+
+    function sendDashboardMode(mode) {
+      if (!isSocketOpen()) {
+        if (dashboardModeEl) {
+          dashboardModeEl.textContent = 'Dashboard socket not connected';
+        }
+        return;
+      }
+      socket.send(JSON.stringify({ type: 'dashboard_mode', mode }));
+      if (dashboardModeEl) {
+        dashboardModeEl.textContent = `Requesting ${normalizeModeLabel(mode)}`;
+      }
+    }
+
+    if (modeInteractiveButton) {
+      modeInteractiveButton.addEventListener('click', () => sendDashboardMode('FULLY_INTERACTIVE'));
+    }
+    if (modeAutomaticButton) {
+      modeAutomaticButton.addEventListener('click', () => sendDashboardMode('FULLY_AUTOMATIC'));
+    }
 
     if (sirenTestButton) {
       sirenTestButton.addEventListener('click', () => {
@@ -899,12 +1024,13 @@ HTML_PAGE = """
 
     function sendControl(nodeId, feature, enabled) {
       if (!isSocketOpen()) {
-        controlStateEl.textContent = 'Dashboard socket not connected';
+        if (dashboardModeEl) {
+          dashboardModeEl.textContent = 'Dashboard socket not connected';
+        }
         return;
       }
       pulseControlVisual(nodeId, feature, Boolean(enabled));
       socket.send(JSON.stringify({ type: 'control_command', nodeId, feature, enabled }));
-      controlStateEl.textContent = `${nodeId} ${feature} command sent`;
     }
 
     function ensureNodeControls(nodes) {
@@ -928,10 +1054,10 @@ HTML_PAGE = """
           controls.className = 'control-grid';
 
           const sirenButton = document.createElement('button');
-          sirenButton.className = 'control-button';
+          sirenButton.className = 'guard-siren-button';
           sirenButton.addEventListener('click', () => {
-            const current = nodeControlBindings[node.node_id]?.state;
-            sendControl(node.node_id, 'siren', !Boolean(current?.siren_on));
+            // Siren is an operator-triggered one-shot command.
+            sendControl(node.node_id, 'siren', true);
           });
 
           const intercomButton = document.createElement('button');
@@ -979,7 +1105,7 @@ HTML_PAGE = """
       if (!ui) return;
 
       ui.state = node;
-      ui.pill.textContent = node.motion_label;
+      ui.pill.textContent = formatMotionLabel(node.motion_label);
       const audioStamp = node.last_audio_cmd && node.last_audio_cmd !== 'NONE'
         ? `audio:${node.last_audio_cmd}`
         : 'audio:none';
@@ -994,14 +1120,14 @@ HTML_PAGE = """
 
       const sirenState = online ? Boolean(node.siren_on) : false;
       ui.sirenButton.dataset.active = String(sirenState);
-      ui.sirenButton.innerHTML = `${sirenState ? 'Siren On' : 'Siren Off'}<small>${online ? `Audible alarm for ${node.label}. Starts silenced.` : 'Offline: no recent telemetry'}</small>`;
+      ui.sirenButton.innerHTML = `${sirenState ? 'Actions Automatic' : 'Sirens Disabled'}<small>${online ? (sirenState ? `Automatic response active for ${node.label}. Security guard can click to return to silence.` : `Ready for ${node.label}. Predator alerts will light the button and beep.`) : 'Offline: no recent telemetry'}</small>`;
 
       const intercomState = online ? Boolean(node.intercom_on) : false;
       ui.intercomButton.dataset.active = String(intercomState);
       ui.intercomButton.innerHTML = `${intercomState ? 'Intercom On' : 'Intercom Off'}<small>${online ? `Two-way talkback for ${node.label}.` : 'Offline: no recent telemetry'}</small>`;
 
       ui.pingButton.dataset.active = 'false';
-      ui.pingButton.innerHTML = `Quiet Ping<small>${online ? `Low-volume wiring check for ${node.label}.` : 'Offline: no recent telemetry'}</small>`;
+      ui.pingButton.innerHTML = `Quiet Ping<small>${online ? `Detection notification ping for ${node.label}.` : 'Offline: no recent telemetry'}</small>`;
     }
 
     function updateNodeRow(node) {
@@ -1009,7 +1135,7 @@ HTML_PAGE = """
       if (!row) return;
 
       row.colNode.textContent = node.node_id;
-      row.colMotion.textContent = node.motion_label;
+      row.colMotion.textContent = formatMotionLabel(node.motion_label);
       row.colSignal.textContent = node.distance_cm != null && node.distance_cm >= 0
         ? `${node.distance_cm} cm`
         : (node.rssi ?? 'n/a');
@@ -1023,18 +1149,35 @@ HTML_PAGE = """
       latestDashboardState = state;
       const nodes = state.nodes || [];
       const activeNodes = nodes.filter((node) => node.motion).map((node) => node.label);
-      statusEl.textContent = state.hub?.connected ? (activeNodes.length ? `Connected · ${activeNodes.join(', ')} active` : 'Connected · all rooms clear') : 'Waiting for telemetry…';
-      controlStateEl.textContent = state.message || 'Idle';
-      broadcastStateEl.textContent = state.hub?.status || 'No commands sent yet';
+      const operationMode = String(state.operation_mode || 'FULLY_INTERACTIVE').toUpperCase();
+      const modeLabel = normalizeModeLabel(operationMode);
+      statusEl.textContent = state.hub?.connected ? (activeNodes.length ? `Connected · ${modeLabel} · ${activeNodes.join(', ')} active` : `Connected · ${modeLabel} · all rooms clear`) : 'Waiting for telemetry…';
+      if (dashboardModeEl) {
+        dashboardModeEl.textContent = operationMode === 'FULLY_AUTOMATIC' ? 'Mode: Green actions automatic' : 'Mode: Blue acoustic standby';
+      }
+      if (modeInteractiveButton) {
+        modeInteractiveButton.dataset.active = String(operationMode === 'FULLY_INTERACTIVE');
+      }
+      if (modeAutomaticButton) {
+        modeAutomaticButton.dataset.active = String(operationMode === 'FULLY_AUTOMATIC');
+      }
       ensureNodeControls(nodes);
       for (const node of nodes) {
         const previousLabel = lastNodeVisualState[node.node_id] || 'CLEAR';
-        const enteredAlert = (
+        const enteringAlert = (
           node.motion_label === 'CONFIRMING_TARGET' || node.motion_label === 'PREDATOR_DETECTED'
-        ) && previousLabel !== node.motion_label;
+        ) && !['CONFIRMING_TARGET', 'PREDATOR_DETECTED'].includes(previousLabel);
 
-        if (enteredAlert) {
+        if (enteringAlert) {
           triggerPhaseTracer(node.node_id, node.motion_label);
+
+          // Attention nudge at the dashboard display (Roku/desk), not on node speaker.
+          const now = Date.now();
+          const lastPing = lastDashboardPingAt[node.node_id] || 0;
+          if (now - lastPing > 4000) {
+            lastDashboardPingAt[node.node_id] = now;
+            playDashboardQuietPing();
+          }
         }
 
         lastNodeVisualState[node.node_id] = node.motion_label;
@@ -1043,7 +1186,6 @@ HTML_PAGE = """
         updateRoomVisual(node);
       }
 
-      latestEl.textContent = JSON.stringify(state.latest_packet || {}, null, 2);
       // update node cards with live distance
       const latestRaw = state.latest_packet?.zone_data?.raw_telemetry;
       if (latestRaw && latestRaw.node_id) {
@@ -1052,7 +1194,9 @@ HTML_PAGE = """
     }
 
     socket.onopen = () => { 
-      controlStateEl.textContent = 'Connected to dashboard websocket';
+      if (dashboardModeEl) {
+        dashboardModeEl.textContent = 'Blue acoustic standby';
+      }
       initializeThreeSceneOnce();
     };
     socket.onmessage = (event) => {
@@ -1061,10 +1205,14 @@ HTML_PAGE = """
         if (message.type === 'dashboard_state') {
           renderDashboard(message);
         } else if (message.type === 'control_ack') {
-          controlStateEl.textContent = message.message;
+          if (dashboardModeEl) {
+            dashboardModeEl.textContent = message.message;
+          }
         }
       } catch (error) {
-        latestEl.textContent = event.data;
+        if (dashboardModeEl) {
+          dashboardModeEl.textContent = 'Dashboard message parse error';
+        }
       }
     };
     socket.onerror = () => { statusEl.textContent = 'Dashboard socket error'; };
@@ -1133,6 +1281,23 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 }))
               continue
 
+            if command_type == "dashboard_mode":
+              requested_mode = message.get("mode")
+              updated_state = set_operation_mode(requested_mode)
+              if updated_state is None:
+                await websocket.send_text(json.dumps({
+                  "type": "control_ack",
+                  "message": f"Ignored dashboard mode {requested_mode}",
+                }))
+                continue
+
+              await websocket.send_text(json.dumps({
+                "type": "control_ack",
+                "message": f"Dashboard mode set to {updated_state['operation_mode']}",
+              }))
+              await broadcast_state(f"dashboard mode {updated_state['operation_mode']}")
+              continue
+
             if command_type != "control_command":
               continue
 
@@ -1173,6 +1338,41 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 await broadcast_state(f"{node_id} ping sent")
               continue
 
+            if feature == "siren":
+              node = get_node_state(node_id)
+              if node is None:
+                await websocket.send_text(json.dumps({
+                  "type": "control_ack",
+                  "message": f"Ignored siren command for {node_id}",
+                }))
+                continue
+
+              node["siren_on"] = True
+              node["siren_manual_off_latch"] = False
+              node["auto_alert_engaged"] = False
+              dashboard_state["updated_at"] = datetime.now().isoformat()
+
+              audio_payload = {
+                "event": "node_audio_command",
+                "node_id": node_id,
+                "feature": "siren",
+                "enabled": True,
+                "issued_at": datetime.now().isoformat(),
+              }
+              ok = await send_hub_command(audio_payload)
+              await websocket.send_text(json.dumps({
+                "type": "control_ack",
+                "message": f"{node_id} siren {'sent' if ok else 'failed'}",
+              }))
+              if ok:
+                asyncio.create_task(clear_node_feature_after(node_id, "siren", 2.8))
+                await broadcast_state(f"{node_id} siren sent")
+              else:
+                node["siren_on"] = False
+                dashboard_state["updated_at"] = datetime.now().isoformat()
+                await broadcast_state(f"{node_id} siren failed")
+              continue
+
             updated_node = toggle_node_feature(node_id, feature, enabled)
             if updated_node is None:
                 await websocket.send_text(json.dumps({
@@ -1186,7 +1386,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 "message": f"{node_id} {feature} set to {'on' if updated_node[f'{feature}_on'] else 'off'}",
             }))
 
-            if feature in {"siren", "intercom"}:
+            if feature == "intercom":
               audio_payload = {
                 "event": "node_audio_command",
                 "node_id": node_id,
@@ -1196,8 +1396,7 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
               }
               await send_hub_command(audio_payload)
               if bool(updated_node[f"{feature}_on"]):
-                reset_delay = 2.6 if feature == "siren" else 1.2
-                asyncio.create_task(clear_node_feature_after(node_id, feature, reset_delay))
+                asyncio.create_task(clear_node_feature_after(node_id, feature, 1.2))
 
             await broadcast_state(f"{node_id} {feature} updated")
     except WebSocketDisconnect:

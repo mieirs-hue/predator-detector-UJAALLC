@@ -88,17 +88,16 @@ async def handle_websocket_message(websocket, message: str) -> None:
         node_id = data.get("node_id", "unknown")
         feature = str(data.get("feature", "")).lower()
         enabled = bool(data.get("enabled", False))
-        if not enabled:
-            return
-
         if feature == "siren":
-            await route_audio_command(node_id, "SIREN")
+            if enabled:
+                await route_audio_command(node_id, "SIREN")
             return
         if feature == "intercom":
             await route_audio_command(node_id, "INTERCOM_ON" if enabled else "INTERCOM_OFF")
             return
         if feature == "ping":
-            await route_audio_command(node_id, "PING")
+            if enabled:
+                await route_audio_command(node_id, "PING")
             return
 
 
