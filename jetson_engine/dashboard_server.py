@@ -37,7 +37,8 @@ RF_R_MIN: float = 2.0               # minimum confidence sphere radius (ft)
 RF_R_MAX: float = 20.0              # maximum confidence sphere radius (ft)
 RF_DISTURBANCE_THRESHOLD: float = 8.0    # dB from baseline before confidence rises
 RF_DISTURBANCE_SCALE: float = 15.0       # dB range mapping 0→1 confidence
-RF_CONFIRM_THRESHOLD: float = 0.50       # smoothed confidence level for CONFIRMING_TARGET
+RF_CONFIRM_ENTER_THRESHOLD: float = 0.90  # default RF confidence required before alarm/confirm
+RF_CONFIRM_EXIT_THRESHOLD: float = 0.50   # reset once confidence settles below this level
 RF_BUZZER_COOLDOWN_S: float = 3.0        # minimum seconds between per-node RF buzzer events
 RF_MIN_FUSION_WEIGHT: float = 0.30       # minimum sum(C_i) to compute fusion centroid
 
@@ -209,6 +210,8 @@ def update_rf_state(node: dict, rssi_value: float | None) -> None:
   meta = ZONE_TOPOLOGY.get(node["node_id"], {})
   threshold = float(meta.get("rf_disturbance_threshold", RF_DISTURBANCE_THRESHOLD))
   scale = float(meta.get("rf_disturbance_scale", RF_DISTURBANCE_SCALE))
+  confirm_enter_threshold = float(meta.get("rf_confirm_enter_threshold", RF_CONFIRM_ENTER_THRESHOLD))
+  confirm_exit_threshold = float(meta.get("rf_confirm_exit_threshold", RF_CONFIRM_EXIT_THRESHOLD))
 
   if node["rf_baseline"] is None:
     node["rf_baseline"] = rssi_value
@@ -226,7 +229,13 @@ def update_rf_state(node: dict, rssi_value: float | None) -> None:
   node["rf_confidence_raw"] = round(c_raw, 4)
   node["rf_confidence_smooth"] = round(c_smooth, 4)
   node["rf_sphere_radius"] = round(RF_R_MIN + c_smooth * (RF_R_MAX - RF_R_MIN), 2)
-  node["rf_state"] = "CONFIRMING_TARGET" if c_smooth >= RF_CONFIRM_THRESHOLD else "NORMAL"
+
+  # Use hysteresis so RF alerts can trigger below the old 0.50 cutoff without
+  # chattering rapidly when confidence hovers near the boundary.
+  if node.get("rf_state") == "CONFIRMING_TARGET":
+    node["rf_state"] = "CONFIRMING_TARGET" if c_smooth >= confirm_exit_threshold else "NORMAL"
+  else:
+    node["rf_state"] = "CONFIRMING_TARGET" if c_smooth >= confirm_enter_threshold else "NORMAL"
 
 
 def compute_rf_fusion(nodes: list) -> dict:
