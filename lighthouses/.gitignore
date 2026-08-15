@@ -1,0 +1,3 @@
+# WiFi credentials — never commit
+src/secrets.h
+.pio/

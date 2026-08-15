@@ -3,6 +3,11 @@
 #include <ArduinoJson.h>
 #include <driver/i2s.h>
 #include <io_pin_remap.h>
+#include <WiFi.h>
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include "secrets.h"
 
 #ifndef NODE_NAME
 #define NODE_NAME "FSS-N01"
@@ -49,6 +54,25 @@ char last_audio_cmd[16] = "NONE";
 unsigned long last_audio_cmd_ms = 0;
 bool intercom_enabled = false;
 bool mic_enabled = false;
+
+// ── RF sensing ──────────────────────────────────────────────────────────────
+// WiFi RSSI: measures ambient 2.4 GHz field; changes with body absorption/reflection
+// BLE scan:  detects nearby advertising devices (phones, wearables); RSSI tracks proximity
+static int   rfWifiRssi       = -99;
+static bool  rfWifiConnected  = false;
+static int   rfBleMaxRssi     = -99;
+static int   rfBleDeviceCount = 0;
+static unsigned long rfBleWindowStart  = 0;
+static unsigned long rfWifiReconnectMs = 0;
+static BLEScan* rfBLEScan = nullptr;
+
+class BleRssiCallback : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice dev) override {
+        int r = dev.getRSSI();
+        if (r > rfBleMaxRssi) rfBleMaxRssi = r;
+        rfBleDeviceCount++;
+    }
+};
 
 float scaledPingLevel(float baseLevel) {
     return constrain(baseLevel * PING_LEVEL_SCALE, 0.0f, 1.0f);
@@ -381,6 +405,21 @@ void setup() {
     }
 
     Serial.printf("[%s] Ready.\n", NODE_NAME);
+
+    // WiFi: background connect — RSSI used as ambient 2.4 GHz disturbance signal
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    Serial.printf("[%s] WiFi connecting to %s\n", NODE_NAME, WIFI_SSID);
+
+    // BLE passive scan: tracks strongest nearby advertising device (no connection, no beacon emitted)
+    BLEDevice::init("");
+    rfBLEScan = BLEDevice::getScan();
+    rfBLEScan->setAdvertisedDeviceCallbacks(new BleRssiCallback(), true);
+    rfBLEScan->setActiveScan(false);
+    rfBLEScan->setInterval(150);
+    rfBLEScan->setWindow(130);
+    rfBLEScan->start(2, nullptr, false);
+    rfBleWindowStart = millis();
 }
 
 void loop() {
@@ -400,9 +439,31 @@ void loop() {
     newLidarDataReady = false;
     last_transmit = now;
 
+    // ── RF sensing update ────────────────────────────────────────────────────
+    if (WiFi.status() == WL_CONNECTED) {
+        rfWifiConnected = true;
+        rfWifiRssi = WiFi.RSSI();
+    } else {
+        rfWifiConnected = false;
+        rfWifiRssi = -99;
+        if (now - rfWifiReconnectMs > 15000) {
+            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+            rfWifiReconnectMs = now;
+        }
+    }
+    // BLE: roll 2-second window — record peak RSSI then restart scan
+    if (now - rfBleWindowStart >= 2000) {
+        rfBLEScan->stop();
+        rfBLEScan->clearResults();
+        rfBleMaxRssi     = -99;
+        rfBleDeviceCount = 0;
+        rfBLEScan->start(2, nullptr, false);
+        rfBleWindowStart = now;
+    }
+
     int dist = get_TFLuna_Distance();
 
-    StaticJsonDocument<384> doc;
+    StaticJsonDocument<640> doc;
     doc["node_id"]      = NODE_NAME;
     doc["timestamp_ms"] = now;
     doc["sequence"]     = sequence_num++;
@@ -428,6 +489,12 @@ void loop() {
     doc["mic_enabled"] = mic_enabled;
     doc["intercom_enabled"] = intercom_enabled;
     doc["supply_note"]  = "TF-Luna needs >=4.5V";
+    // RF sensing fields
+    doc["rssi"]         = rfWifiConnected ? rfWifiRssi : -99;  // primary: WiFi RSSI
+    doc["wifi_rssi"]    = rfWifiRssi;
+    doc["wifi_ok"]      = rfWifiConnected;
+    doc["ble_rssi"]     = rfBleMaxRssi;   // peak BLE device RSSI in last 2s window
+    doc["ble_count"]    = rfBleDeviceCount;
 
     serializeJson(doc, Serial);
     Serial.println();

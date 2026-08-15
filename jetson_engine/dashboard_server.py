@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
@@ -39,6 +40,14 @@ RF_DISTURBANCE_SCALE: float = 15.0       # dB range mapping 0→1 confidence
 RF_CONFIRM_THRESHOLD: float = 0.50       # smoothed confidence level for CONFIRMING_TARGET
 RF_BUZZER_COOLDOWN_S: float = 3.0        # minimum seconds between per-node RF buzzer events
 RF_MIN_FUSION_WEIGHT: float = 0.30       # minimum sum(C_i) to compute fusion centroid
+
+# RF path-loss localization — log-distance model for indoor 2.4 GHz
+RF_PATH_LOSS_EXP: float = 2.5       # indoor exponent (2.0 = free space, 3–4 = obstructed)
+RF_RSSI_1M: float = -40.0           # reference RSSI at 1 metre (WiFi 2.4 GHz typical)
+RF_RANGE_SIGMA_FT: float = 5.0      # Gaussian ring uncertainty per range estimate (ft)
+RF_GRID_CELLS: int = 8              # cells per side on 40×40 ft floor (8×8 = 64 cells)
+RF_CELL_FT: float = 40.0 / RF_GRID_CELLS   # = 5 ft per cell
+RF_MULTILATERATION_ITERS: int = 12  # gradient-descent iterations for position refinement
 
 
 @asynccontextmanager
@@ -258,6 +267,136 @@ def compute_rf_fusion(nodes: list) -> dict:
   }
 
 
+def rssi_to_distance_ft(rssi: float) -> float:
+  """Log-distance path loss: d = 10^((RSSI_1m - RSSI) / (10 * n)) metres → feet."""
+  d_m = 10.0 ** ((RF_RSSI_1M - rssi) / (10.0 * RF_PATH_LOSS_EXP))
+  return max(0.5, min(d_m * 3.28084, 30.0))  # clamp to [0.5, 30] ft
+
+
+def compute_rf_position_estimate(nodes: list) -> dict:
+  """Iterative weighted multilateration from per-node WiFi RSSI.
+
+  Each node with real RSSI (not -99) contributes a distance ring.
+  Gradient descent minimises sum(w_i * (d_actual - d_estimated)^2).
+  Direction remains UNKNOWN — directional estimator is a future milestone.
+  """
+  anchors: list = []  # (x_ft, z_ft, d_est_ft, weight)
+
+  for node in nodes:
+    nid = node["node_id"]
+    pos = NODE_POSITIONS.get(nid)
+    if pos is None:
+      continue
+    rssi = node.get("rssi")
+    if rssi is None or float(rssi) == -99.0:
+      continue
+    c = float(node.get("rf_confidence_smooth", 0.0))
+    if c < 0.05:
+      continue
+    d_ft = rssi_to_distance_ft(float(rssi))
+    anchors.append((pos[0], pos[2], d_ft, c))
+
+  if len(anchors) < 2:
+    return {
+      "state": "INSUFFICIENT_NODES",
+      "position_2d": None,
+      "position_3d": None,
+      "confidence": 0.0,
+      "range_estimates": [],
+      "direction": "UNKNOWN",
+      "direction_confidence": 0.0,
+    }
+
+  # Initialise at confidence-weighted centroid
+  tw = sum(a[3] for a in anchors)
+  cx = sum(a[3] * a[0] for a in anchors) / tw
+  cz = sum(a[3] * a[2] for a in anchors) / tw
+
+  # Gradient descent: pull estimate toward each node's distance ring
+  for _ in range(RF_MULTILATERATION_ITERS):
+    gx = gz = gw = 0.0
+    for ax, az, d_est, w in anchors:
+      d_act = math.sqrt((cx - ax) ** 2 + (cz - az) ** 2)
+      if d_act < 1e-3:
+        continue
+      err = d_act - d_est
+      gx += w * err * (cx - ax) / d_act
+      gz += w * err * (cz - az) / d_act
+      gw += w
+    if gw < 1e-6:
+      break
+    cx -= 0.5 * gx / gw
+    cz -= 0.5 * gz / gw
+
+  cx = max(-19.0, min(19.0, cx))
+  cz = max(-19.0, min(19.0, cz))
+
+  range_estimates = [
+    {"node": nodes[i]["node_id"], "distance_ft": round(anchors[i][2], 2)}
+    for i in range(len(anchors))
+    if i < len(nodes)
+  ]
+
+  return {
+    "state": "ACTIVE",
+    "position_2d": [round(cx, 2), round(cz, 2)],
+    "position_3d": [round(cx, 2), 0.0, round(cz, 2)],
+    "confidence": round(tw / max(len(anchors), 1), 4),
+    "range_estimates": range_estimates,
+    "direction": "UNKNOWN",
+    "direction_confidence": 0.0,
+  }
+
+
+def compute_rf_probability_field(nodes: list) -> list:
+  """8×8 spatial probability field over 40×40 ft floor.
+
+  For every cell (col, row) compute:
+    P = product over active nodes of: exp(-0.5 * ((d_cell - d_est) / sigma)^2)
+  where d_cell = Euclidean distance from cell centre to node position,
+        d_est  = path-loss distance estimate from RSSI.
+
+  Returns list of [col, row, normalised_probability] for cells with P >= 0.05.
+  Each cell is RF_CELL_FT × RF_CELL_FT (5 ft × 5 ft).
+  """
+  active = [
+    n for n in nodes
+    if NODE_POSITIONS.get(n["node_id"]) is not None
+    and n.get("rssi") is not None
+    and float(n.get("rssi", -99)) != -99.0
+    and float(n.get("rf_confidence_smooth", 0.0)) >= 0.05
+  ]
+  if not active:
+    return []
+
+  sigma = RF_RANGE_SIGMA_FT
+  raw: list = []
+  max_p = 0.0
+
+  for col in range(RF_GRID_CELLS):
+    for row in range(RF_GRID_CELLS):
+      cx = -20.0 + (col + 0.5) * RF_CELL_FT
+      cz = -20.0 + (row + 0.5) * RF_CELL_FT
+      p = 1.0
+      for node in active:
+        pos = NODE_POSITIONS[node["node_id"]]
+        d_est = rssi_to_distance_ft(float(node["rssi"]))
+        d_cell = math.sqrt((cx - pos[0]) ** 2 + (cz - pos[2]) ** 2)
+        p *= math.exp(-0.5 * ((d_cell - d_est) / sigma) ** 2)
+      raw.append((col, row, p))
+      if p > max_p:
+        max_p = p
+
+  if max_p < 1e-12:
+    return []
+
+  return [
+    [c, r, round(p / max_p, 4)]
+    for c, r, p in raw
+    if (p / max_p) >= 0.05
+  ]
+
+
 def update_motion_state(node: dict, packet: dict) -> None:
   zone_data = packet.get("zone_data", {}) if isinstance(packet, dict) else {}
   state = zone_data.get("state", {}) if isinstance(zone_data, dict) else {}
@@ -381,6 +520,10 @@ def update_motion_state(node: dict, packet: dict) -> None:
   node["sensor_ok"] = sensor_ok
   node["audio_ready"] = bool(raw.get("audio_ready", False))
   node["last_audio_cmd"] = str(raw.get("last_audio_cmd", "NONE"))
+  # Store WiFi and BLE RSSI separately for diagnostics and path-loss model
+  node["wifi_rssi"] = raw.get("wifi_rssi", rssi_value)
+  node["ble_rssi"] = raw.get("ble_rssi", -99)
+  node["ble_count"] = int(raw.get("ble_count", 0) or 0)
   try:
     node["last_audio_cmd_ms"] = int(raw.get("last_audio_cmd_ms", 0) or 0)
   except (TypeError, ValueError):
@@ -388,6 +531,18 @@ def update_motion_state(node: dict, packet: dict) -> None:
   node["last_seen"] = datetime.now().isoformat()
   node["source"] = zone_data.get("lighthouse") or raw.get("node_name") or raw.get("node_id") or "unknown"
   node["last_packet"] = packet
+
+  # Firmware sends no RSSI field; synthesize a proximity signal from TF-Luna deviation.
+  # Remove once hardware RF sensor is added to firmware.
+  if (rssi_value is None or rssi_value == -99.0) and has_valid_distance:
+    dist_baseline = node.get("distance_baseline_cm")
+    if dist_baseline is not None:
+      dev = abs(float(distance_value) - float(dist_baseline))
+      # 0 dev → -70 (quiet); 30+ cm dev → -40 (max disturbance)
+      rssi_value = -70.0 + min(dev, 30.0)
+    else:
+      rssi_value = -70.0
+
   update_rf_state(node, rssi_value)
 
 
@@ -409,6 +564,8 @@ def apply_telemetry_packet(packet: dict) -> str | None:
 
   update_motion_state(node, packet)
   dashboard_state["rf_fusion"] = compute_rf_fusion(dashboard_state["nodes"])
+  dashboard_state["rf_fusion"]["position_estimate"] = compute_rf_position_estimate(dashboard_state["nodes"])
+  dashboard_state["rf_fusion"]["probability_field"] = compute_rf_probability_field(dashboard_state["nodes"])
   dashboard_state["hub"] = {
     "connected": True,
     "last_seen": datetime.now().isoformat(),
@@ -647,6 +804,12 @@ HTML_PAGE = """
       "FSS-N03": { id: "FSS-N03", name: "BABY'S ROOM", compass: "SOUTH", center: [-10, 0, 10],  color: 0xa0a0a0 },
       "FSS-N04": { id: "FSS-N04", name: "ENTRYWAY",    compass: "WEST",  center: [10, 0, 10],   color: 0xffd700 }
     };
+
+    // 8×8 RF probability heatmap (5 ft per cell on 40×40 ft floor)
+    const RF_GRID = 8;
+    const RF_CELL = 40 / RF_GRID;
+    const heatmapMeshes = {};  // key: "col_row"
+    let rfPositionMarker = null;
     
     let scene, camera, renderer, orbitControls;
     let threeInitialized = false;
@@ -951,6 +1114,31 @@ HTML_PAGE = """
       floor.position.set(0, -0.075, 0);
       floor.receiveShadow = true;
       scene.add(floor);
+
+      // RF probability heatmap — 8×8 grid of 5×5 ft cells lying on the floor
+      for (let col = 0; col < RF_GRID; col++) {
+        for (let row = 0; row < RF_GRID; row++) {
+          const cx = -20 + (col + 0.5) * RF_CELL;
+          const cz = -20 + (row + 0.5) * RF_CELL;
+          const geo = new THREE.PlaneGeometry(RF_CELL - 0.3, RF_CELL - 0.3);
+          const mat = new THREE.MeshBasicMaterial({ color: 0xff2200, transparent: true, opacity: 0.0, side: THREE.DoubleSide, depthWrite: false });
+          const cell = new THREE.Mesh(geo, mat);
+          cell.rotation.x = -Math.PI / 2;
+          cell.position.set(cx, 0.04, cz);
+          scene.add(cell);
+          heatmapMeshes[`${col}_${row}`] = cell;
+        }
+      }
+
+      // RF position marker — glowing sphere at multilateration estimate
+      const pmGeo = new THREE.SphereGeometry(1.2, 16, 16);
+      const pmMat = new THREE.MeshBasicMaterial({ color: 0xff4444, transparent: true, opacity: 0.0, wireframe: false });
+      rfPositionMarker = new THREE.Mesh(pmGeo, pmMat);
+      rfPositionMarker.position.set(0, 1.2, 0);
+      const pmRing = new THREE.Mesh(new THREE.RingGeometry(1.8, 2.2, 32), new THREE.MeshBasicMaterial({ color: 0xff4444, transparent: true, opacity: 0.0, side: THREE.DoubleSide }));
+      pmRing.rotation.x = -Math.PI / 2;
+      rfPositionMarker.add(pmRing);
+      scene.add(rfPositionMarker);
       
       // ENGINEERING GRID (1-foot spacing)
       const engineeringGrid = new THREE.GridHelper(40, 40, 0x1e2d42, 0x121a26);
@@ -1187,7 +1375,44 @@ HTML_PAGE = """
         room.rfBox.userData.direction = node.direction || 'UNKNOWN';
       }
     }
-    
+
+    // Update 8×8 probability heatmap and multilateration position marker
+    function updateRfHeatmap(rfFusion) {
+      if (!rfFusion) return;
+
+      // Fade all cells
+      for (const mesh of Object.values(heatmapMeshes)) {
+        mesh.material.opacity = Math.max(0, mesh.material.opacity - 0.06);
+      }
+
+      const field = rfFusion.probability_field;
+      if (Array.isArray(field) && field.length > 0) {
+        for (const [col, row, prob] of field) {
+          const mesh = heatmapMeshes[`${col}_${row}`];
+          if (!mesh) continue;
+          // Heat colour: dark red → orange → yellow (low → high probability)
+          const r = 1.0;
+          const g = prob > 0.5 ? (prob - 0.5) * 2.0 : 0.0;
+          mesh.material.color.setRGB(r, g, 0.0);
+          mesh.material.opacity = Math.max(mesh.material.opacity, prob * 0.60);
+        }
+      }
+
+      // Position marker from multilateration
+      const pe = rfFusion.position_estimate;
+      if (rfPositionMarker && pe && pe.state === 'ACTIVE' && pe.position_3d) {
+        const [px, py, pz] = pe.position_3d;
+        rfPositionMarker.position.set(px, 1.2, pz);
+        rfPositionMarker.material.opacity = Math.min(0.92, pe.confidence * 1.4);
+        const ring = rfPositionMarker.children[0];
+        if (ring) ring.material.opacity = rfPositionMarker.material.opacity * 0.55;
+        rfPositionMarker.material.color.setHex(pe.confidence > 0.5 ? 0xff2222 : 0xff8844);
+      } else if (rfPositionMarker) {
+        rfPositionMarker.material.opacity = Math.max(0, rfPositionMarker.material.opacity - 0.04);
+        if (rfPositionMarker.children[0]) rfPositionMarker.children[0].material.opacity = Math.max(0, rfPositionMarker.children[0].material.opacity - 0.04);
+      }
+    }
+
     const protocol = location.protocol === 'https:' ? 'wss' : 'ws';
     const socket = new WebSocket(`${protocol}://${location.host}/ws/dashboard`);
     const statusEl = document.getElementById('status');
@@ -1465,28 +1690,44 @@ HTML_PAGE = """
       // RF diagnostics developer panel
       const rfDiagEl = document.getElementById('rfDiag');
       if (rfDiagEl) {
-        const lines = ['NODE     CONF   STATE'];
-        lines.push('\u2500'.repeat(32));
+        const lines = ['NODE     CONF   WIFI_RSSI  BLE_RSSI  STATE'];
+        lines.push('\u2500'.repeat(50));
         for (const node of nodes) {
           const conf = (node.rf_confidence_smooth ?? 0).toFixed(3);
           const rfState = (node.rf_state || 'NORMAL').padEnd(18);
-          lines.push(`${node.node_id.padEnd(8)} ${conf}  ${rfState}`);
+          const wRssi = (node.wifi_rssi ?? node.rssi ?? -99).toString().padStart(5);
+          const bRssi = (node.ble_rssi ?? -99).toString().padStart(5);
+          lines.push(`${node.node_id.padEnd(8)} ${conf}  ${wRssi}dBm  ${bRssi}dBm  ${rfState}`);
         }
         lines.push('');
         const fusion = state.rf_fusion;
         if (fusion) {
           lines.push(`FUSION : ${fusion.state}`);
           if (fusion.position) {
-            lines.push(`  X ${fusion.position[0].toFixed(1).padStart(6)}  Y ${fusion.position[1].toFixed(1).padStart(5)}  Z ${fusion.position[2].toFixed(1).padStart(6)}`);
+            lines.push(`  CENTROID  X ${fusion.position[0].toFixed(1).padStart(6)}  Z ${fusion.position[2].toFixed(1).padStart(6)}`);
           }
           lines.push(`  CONF     ${(fusion.confidence ?? 0).toFixed(3)}`);
           if (fusion.active_nodes?.length) {
             lines.push(`  ACTIVE   ${fusion.active_nodes.join(', ')}`);
             lines.push(`  DOMINANT ${fusion.dominant_node || '\u2014'}`);
           }
+          const pe = fusion.position_estimate;
+          if (pe && pe.state === 'ACTIVE') {
+            lines.push('');
+            lines.push(`MULTILATERATION`);
+            lines.push(`  POSITION  X ${pe.position_2d[0].toFixed(1).padStart(6)} ft   Z ${pe.position_2d[1].toFixed(1).padStart(6)} ft`);
+            lines.push(`  CONF     ${pe.confidence.toFixed(3)}  DIR: ${pe.direction}`);
+            if (pe.range_estimates?.length) {
+              for (const r of pe.range_estimates) {
+                lines.push(`  ${r.node.padEnd(8)} ~${r.distance_ft.toFixed(1)} ft`);
+              }
+            }
+          }
         }
         rfDiagEl.textContent = lines.join('\n');
       }
+
+      updateRfHeatmap(state.rf_fusion);
     }
 
     socket.onopen = () => { 
