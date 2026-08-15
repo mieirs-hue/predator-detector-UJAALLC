@@ -65,6 +65,8 @@ def build_node_state(node_id: str) -> dict:
     "last_audio_cmd_ms": 0,
     "last_seen": None,
     "source": "Awaiting telemetry",
+    "mic_enabled": False,
+    "mic_state": "MUTED",
     "siren_on": False,
     "intercom_on": False,
     "siren_manual_off_latch": False,
@@ -299,7 +301,17 @@ def apply_telemetry_packet(packet: dict) -> str | None:
 
 def toggle_node_feature(node_id: str, feature: str, enabled: bool | None = None) -> dict | None:
   node = get_node_state(node_id)
-  if node is None or feature not in {"siren", "intercom"}:
+  if node is None:
+    return None
+
+  if feature == "mic":
+    next_value = not bool(node.get("mic_enabled")) if enabled is None else bool(enabled)
+    node["mic_enabled"] = next_value
+    node["mic_state"] = "UNMUTED" if next_value else "MUTED"
+    dashboard_state["updated_at"] = datetime.now().isoformat()
+    return node
+
+  if feature not in {"siren", "intercom"}:
     return None
 
   key = f"{feature}_on"
@@ -523,6 +535,8 @@ HTML_PAGE = """
     const speakerNodes = [
       { id: 'FSS-N01', zone: 'Office' },
       { id: 'FSS-N02', zone: 'Garage' },
+      { id: 'FSS-N03', zone: "Baby's Room" },
+      { id: 'FSS-N04', zone: 'Entryway' },
     ];
     let latestDashboardState = null;
     let audioContext = null;
@@ -666,13 +680,10 @@ HTML_PAGE = """
       }
 
       try {
-        const liveNodeIds = new Set(
-          (latestDashboardState?.nodes || [])
-            .filter((n) => !!n.last_seen)
-            .map((n) => n.node_id)
-        );
-        const targets = speakerNodes.filter((n) => liveNodeIds.has(n.id));
-        const sequenceTargets = targets.length ? targets : speakerNodes;
+        // Run the full fleet cycle in the fixed order requested by the operator.
+        // Do not narrow this to only the currently live subset, or the test can stop
+        // after N02 even when the remaining nodes are valid members of the system.
+        const sequenceTargets = speakerNodes;
 
         for (const targetNode of sequenceTargets) {
           await playWebSirenTone(500);
@@ -1053,6 +1064,14 @@ HTML_PAGE = """
           const controls = document.createElement('div');
           controls.className = 'control-grid';
 
+          const micButton = document.createElement('button');
+          micButton.className = 'control-button';
+          micButton.addEventListener('click', () => {
+            const current = nodeControlBindings[node.node_id]?.state;
+            const enabled = !(current && current.mic_enabled);
+            sendControl(node.node_id, 'mic', enabled);
+          });
+
           const sirenButton = document.createElement('button');
           sirenButton.className = 'guard-siren-button';
           sirenButton.addEventListener('click', () => {
@@ -1073,6 +1092,7 @@ HTML_PAGE = """
             sendControl(node.node_id, 'ping', true);
           });
 
+          controls.appendChild(micButton);
           controls.appendChild(sirenButton);
           controls.appendChild(intercomButton);
           controls.appendChild(pingButton);
@@ -1094,7 +1114,7 @@ HTML_PAGE = """
           row.appendChild(colLast);
           rowsEl.appendChild(row);
 
-          nodeControlBindings[node.node_id] = { nodeControl, pill, source, sirenButton, intercomButton, pingButton, state: null };
+          nodeControlBindings[node.node_id] = { nodeControl, pill, source, micButton, sirenButton, intercomButton, pingButton, state: null };
           nodeRowBindings[node.node_id] = { colNode, colMotion, colSignal, colState, colLast };
         }
       }
@@ -1113,6 +1133,11 @@ HTML_PAGE = """
 
       const lastSeenMs = node.last_seen ? new Date(node.last_seen).getTime() : 0;
       const online = Boolean(lastSeenMs) && (Date.now() - lastSeenMs) <= 10000;
+
+      const micEnabled = online ? Boolean(node.mic_enabled) : false;
+      ui.micButton.disabled = !online;
+      ui.micButton.dataset.active = String(micEnabled);
+      ui.micButton.innerHTML = `${micEnabled ? 'Mic Unmute' : 'Mic Mute'}<small>${online ? `Mic sensor state for ${node.label}.` : 'Offline: no recent telemetry'}</small>`;
 
       ui.sirenButton.disabled = !online;
       ui.intercomButton.disabled = !online;
@@ -1313,12 +1338,30 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
               }))
               continue
 
-            if feature in {"siren", "intercom", "ping"} and not node_is_online(existing):
+            if feature in {"siren", "intercom", "ping", "mic"} and not node_is_online(existing):
               await websocket.send_text(json.dumps({
                 "type": "control_ack",
                 "message": f"{node_id} is offline (no recent telemetry). Command blocked.",
               }))
               await broadcast_state(f"{node_id} offline: {feature} not sent")
+              continue
+
+            if feature == "mic":
+              updated_node = toggle_node_feature(node_id, "mic", bool(enabled))
+              audio_payload = {
+                "event": "node_audio_command",
+                "node_id": node_id,
+                "feature": "mic",
+                "enabled": bool(updated_node["mic_enabled"]),
+                "issued_at": datetime.now().isoformat(),
+              }
+              ok = await send_hub_command(audio_payload)
+              await websocket.send_text(json.dumps({
+                "type": "control_ack",
+                "message": f"{node_id} mic {'enabled' if updated_node['mic_enabled'] else 'muted'} {'sent' if ok else 'failed'}",
+              }))
+              if ok:
+                await broadcast_state(f"{node_id} mic {updated_node['mic_state']}")
               continue
 
             if feature == "ping":

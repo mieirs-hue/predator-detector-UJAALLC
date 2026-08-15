@@ -44,6 +44,7 @@ bool audio_ready = false;
 char last_audio_cmd[16] = "NONE";
 unsigned long last_audio_cmd_ms = 0;
 bool intercom_enabled = false;
+bool mic_enabled = false;
 
 void runI2CScan() {
     i2c_scan_count = 0;
@@ -193,6 +194,18 @@ void handleAudioCommand(const String& command) {
     if (command == "INTERCOM_OFF") {
         intercom_enabled = false;
         playTone(340, 80, 0.04f);
+        return;
+    }
+
+    if (command == "MIC_ENABLE") {
+        mic_enabled = true;
+        playTone(620, 80, 0.08f);
+        return;
+    }
+
+    if (command == "MIC_MUTE") {
+        mic_enabled = false;
+        playTone(260, 80, 0.05f);
         return;
     }
 
@@ -396,6 +409,8 @@ void loop() {
     doc["audio_ready"] = audio_ready;
     doc["last_audio_cmd"] = last_audio_cmd;
     doc["last_audio_cmd_ms"] = last_audio_cmd_ms;
+    doc["mic_enabled"] = mic_enabled;
+    doc["intercom_enabled"] = intercom_enabled;
     doc["supply_note"]  = "TF-Luna needs >=4.5V";
 
     serializeJson(doc, Serial);

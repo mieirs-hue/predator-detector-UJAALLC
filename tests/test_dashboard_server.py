@@ -70,6 +70,27 @@ class DashboardServerTests(unittest.TestCase):
         self.assertFalse(node["siren_on"])
         self.assertTrue(node["siren_manual_off_latch"])
 
+    def test_node_mic_toggle_tracks_explicit_muted_state(self) -> None:
+        node = self.make_node()
+
+        updated = dashboard_server.toggle_node_feature(node["node_id"], "mic", True)
+        self.assertIsNotNone(updated)
+        self.assertTrue(updated["mic_enabled"])
+        self.assertEqual(updated["mic_state"], "UNMUTED")
+
+        updated = dashboard_server.toggle_node_feature(node["node_id"], "mic", False)
+        self.assertFalse(updated["mic_enabled"])
+        self.assertEqual(updated["mic_state"], "MUTED")
+
+    def test_cycle_speaker_sequence_includes_all_four_nodes(self) -> None:
+        source = dashboard_server.__file__
+        with open(source, "r", encoding="utf-8") as handle:
+            contents = handle.read()
+
+        self.assertIn("const sequenceTargets = speakerNodes;", contents)
+        for node_id in ["FSS-N01", "FSS-N02", "FSS-N03", "FSS-N04"]:
+            self.assertIn(f"{{ id: '{node_id}', zone:", contents)
+
 
 if __name__ == "__main__":
     unittest.main()

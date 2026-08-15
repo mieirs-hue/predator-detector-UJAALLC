@@ -99,6 +99,12 @@ async def handle_websocket_message(websocket, message: str) -> None:
             if enabled:
                 await route_audio_command(node_id, "PING")
             return
+        if feature == "mic":
+            if enabled:
+                await route_audio_command(node_id, "MIC_ENABLE")
+            else:
+                await route_audio_command(node_id, "MIC_MUTE")
+            return
 
 
 async def route_audio_command(node_id: str, command: str) -> None:
