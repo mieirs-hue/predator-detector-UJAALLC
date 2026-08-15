@@ -639,10 +639,12 @@ HTML_PAGE = """
       const room = ROOMS[nodeId];
       if (!room) return;
 
+      const isPingFeature = feature === 'ping' || feature === 'quiet_ping';
+
       const now = Date.now();
       if (room.phaseBox) {
         room.phaseBox.userData.mode = feature === 'siren' && enabled ? 'PREDATOR_DETECTED' : 'CONTROL_ACTIVE';
-        room.phaseBox.userData.alertUntil = now + (feature === 'ping' ? 900 : 2200);
+        room.phaseBox.userData.alertUntil = now + (isPingFeature ? 900 : 2200);
         room.phaseBox.userData.controlColor = room.color;
         room.phaseBox.scale.set(
           feature === 'siren' && enabled ? 1.45 : 1.16,
@@ -653,10 +655,10 @@ HTML_PAGE = """
 
       const sphere = nodeSpheres[nodeId];
       if (sphere) {
-        sphere.userData.controlUntil = now + (feature === 'ping' ? 900 : 2200);
+        sphere.userData.controlUntil = now + (isPingFeature ? 900 : 2200);
         sphere.userData.controlFeature = feature;
         sphere.userData.controlEnabled = enabled;
-        sphere.userData.highlightUntil = now + (feature === 'ping' ? 900 : 1400);
+        sphere.userData.highlightUntil = now + (isPingFeature ? 900 : 1400);
       }
     }
 
@@ -1079,6 +1081,12 @@ HTML_PAGE = """
             sendControl(node.node_id, 'siren', true);
           });
 
+          const loudSirenButton = document.createElement('button');
+          loudSirenButton.className = 'guard-siren-button';
+          loudSirenButton.addEventListener('click', () => {
+            sendControl(node.node_id, 'loud_siren_test', true);
+          });
+
           const intercomButton = document.createElement('button');
           intercomButton.className = 'control-button';
           intercomButton.addEventListener('click', () => {
@@ -1089,11 +1097,12 @@ HTML_PAGE = """
           const pingButton = document.createElement('button');
           pingButton.className = 'control-button';
           pingButton.addEventListener('click', () => {
-            sendControl(node.node_id, 'ping', true);
+            sendControl(node.node_id, 'quiet_ping', true);
           });
 
           controls.appendChild(micButton);
           controls.appendChild(sirenButton);
+          controls.appendChild(loudSirenButton);
           controls.appendChild(intercomButton);
           controls.appendChild(pingButton);
           nodeControl.appendChild(title);
@@ -1114,7 +1123,7 @@ HTML_PAGE = """
           row.appendChild(colLast);
           rowsEl.appendChild(row);
 
-          nodeControlBindings[node.node_id] = { nodeControl, pill, source, micButton, sirenButton, intercomButton, pingButton, state: null };
+          nodeControlBindings[node.node_id] = { nodeControl, pill, source, micButton, sirenButton, loudSirenButton, intercomButton, pingButton, state: null };
           nodeRowBindings[node.node_id] = { colNode, colMotion, colSignal, colState, colLast };
         }
       }
@@ -1140,12 +1149,18 @@ HTML_PAGE = """
       ui.micButton.innerHTML = `${micEnabled ? 'Mic Unmute' : 'Mic Mute'}<small>${online ? `Mic sensor state for ${node.label}.` : 'Offline: no recent telemetry'}</small>`;
 
       ui.sirenButton.disabled = !online;
+      const loudTestAllowed = node.node_id === 'FSS-N03' || node.node_id === 'FSS-N04';
+      ui.loudSirenButton.disabled = !online || !loudTestAllowed;
+      ui.loudSirenButton.style.display = loudTestAllowed ? '' : 'none';
       ui.intercomButton.disabled = !online;
       ui.pingButton.disabled = !online;
 
       const sirenState = online ? Boolean(node.siren_on) : false;
       ui.sirenButton.dataset.active = String(sirenState);
       ui.sirenButton.innerHTML = `${sirenState ? 'Actions Automatic' : 'Sirens Disabled'}<small>${online ? (sirenState ? `Automatic response active for ${node.label}. Security guard can click to return to silence.` : `Ready for ${node.label}. Predator alerts will light the button and beep.`) : 'Offline: no recent telemetry'}</small>`;
+
+      ui.loudSirenButton.dataset.active = 'false';
+      ui.loudSirenButton.innerHTML = `Loud Siren Test<small>${online ? (loudTestAllowed ? `Temporary long burst test for ${node.label}.` : 'Available only on N03/N04 for troubleshooting') : 'Offline: no recent telemetry'}</small>`;
 
       const intercomState = online ? Boolean(node.intercom_on) : false;
       ui.intercomButton.dataset.active = String(intercomState);
@@ -1338,12 +1353,49 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
               }))
               continue
 
-            if feature in {"siren", "intercom", "ping", "mic"} and not node_is_online(existing):
+            if feature in {"siren", "loud_siren_test", "intercom", "ping", "quiet_ping", "mic"} and not node_is_online(existing):
               await websocket.send_text(json.dumps({
                 "type": "control_ack",
                 "message": f"{node_id} is offline (no recent telemetry). Command blocked.",
               }))
               await broadcast_state(f"{node_id} offline: {feature} not sent")
+              continue
+
+            if feature == "loud_siren_test":
+              if node_id not in {"FSS-N03", "FSS-N04"}:
+                await websocket.send_text(json.dumps({
+                  "type": "control_ack",
+                  "message": f"{node_id} loud siren test is restricted to N03/N04",
+                }))
+                continue
+
+              node = get_node_state(node_id)
+              if node is not None:
+                node["siren_on"] = True
+                node["siren_manual_off_latch"] = False
+                node["auto_alert_engaged"] = False
+                dashboard_state["updated_at"] = datetime.now().isoformat()
+
+              audio_payload = {
+                "event": "node_audio_command",
+                "node_id": node_id,
+                "feature": "loud_siren_test",
+                "enabled": True,
+                "issued_at": datetime.now().isoformat(),
+              }
+              ok = await send_hub_command(audio_payload)
+              await websocket.send_text(json.dumps({
+                "type": "control_ack",
+                "message": f"{node_id} loud siren test {'sent' if ok else 'failed'}",
+              }))
+              if ok:
+                asyncio.create_task(clear_node_feature_after(node_id, "siren", 8.5))
+                await broadcast_state(f"{node_id} loud siren test sent")
+              else:
+                if node is not None:
+                  node["siren_on"] = False
+                  dashboard_state["updated_at"] = datetime.now().isoformat()
+                await broadcast_state(f"{node_id} loud siren test failed")
               continue
 
             if feature == "mic":
@@ -1379,6 +1431,23 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
               }))
               if ok:
                 await broadcast_state(f"{node_id} ping sent")
+              continue
+
+            if feature == "quiet_ping":
+              audio_payload = {
+                "event": "node_audio_command",
+                "node_id": node_id,
+                "feature": "quiet_ping",
+                "enabled": True,
+                "issued_at": datetime.now().isoformat(),
+              }
+              ok = await send_hub_command(audio_payload)
+              await websocket.send_text(json.dumps({
+                "type": "control_ack",
+                "message": f"{node_id} quiet ping {'sent' if ok else 'failed'}",
+              }))
+              if ok:
+                await broadcast_state(f"{node_id} quiet ping sent")
               continue
 
             if feature == "siren":

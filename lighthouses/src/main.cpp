@@ -21,6 +21,10 @@
 #define TF_LUNA_INT_PIN -1
 #endif
 
+#ifndef PING_LEVEL_SCALE
+#define PING_LEVEL_SCALE 1.0f
+#endif
+
 const uint32_t I2C_CLOCK_HZ = 100000;
 const uint8_t LIDAR_READ_RETRIES = 3;
 const unsigned long INITIAL_DEBUG_SCAN_MS = 10000; // Continuously scan I2C for 10s on boot
@@ -45,6 +49,10 @@ char last_audio_cmd[16] = "NONE";
 unsigned long last_audio_cmd_ms = 0;
 bool intercom_enabled = false;
 bool mic_enabled = false;
+
+float scaledPingLevel(float baseLevel) {
+    return constrain(baseLevel * PING_LEVEL_SCALE, 0.0f, 1.0f);
+}
 
 void runI2CScan() {
     i2c_scan_count = 0;
@@ -177,9 +185,17 @@ void handleAudioCommand(const String& command) {
 
     if (command == "PING") {
         // Detection notification ping (audible but shorter than siren).
-        playTone(1100, 120, 0.55f);
+        playTone(1100, 120, scaledPingLevel(0.55f));
         delay(40);
-        playTone(900, 120, 0.55f);
+        playTone(900, 120, scaledPingLevel(0.55f));
+        return;
+    }
+
+    if (command == "QUIET_PING") {
+        // Lower-profile operator ping used by the Quiet Ping dashboard control.
+        playTone(1020, 110, scaledPingLevel(0.38f));
+        delay(45);
+        playTone(860, 110, scaledPingLevel(0.38f));
         return;
     }
 

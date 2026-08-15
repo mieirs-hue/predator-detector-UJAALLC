@@ -50,6 +50,7 @@ HYSTERESIS_CONFIG = {
 active_locks: Dict[str, dict] = {}
 visualizer_clients: Set[object] = set()
 active_serial_ports: Dict[str, serial.Serial] = {}
+AUDIO_RELIABILITY_NODES = {"FSS-N03", "FSS-N04"}
 
 
 def resolve_available_port(node_name: str) -> str | None:
@@ -90,7 +91,10 @@ async def handle_websocket_message(websocket, message: str) -> None:
         enabled = bool(data.get("enabled", False))
         if feature == "siren":
             if enabled:
-                await route_audio_command(node_id, "SIREN")
+                if node_id in AUDIO_RELIABILITY_NODES:
+                    await route_audio_command_burst(node_id, ["PING", "SIREN", "SIREN"], 0.06)
+                else:
+                    await route_audio_command(node_id, "SIREN")
             return
         if feature == "intercom":
             await route_audio_command(node_id, "INTERCOM_ON" if enabled else "INTERCOM_OFF")
@@ -98,6 +102,24 @@ async def handle_websocket_message(websocket, message: str) -> None:
         if feature == "ping":
             if enabled:
                 await route_audio_command(node_id, "PING")
+            return
+        if feature == "quiet_ping":
+            if enabled:
+                if node_id in AUDIO_RELIABILITY_NODES:
+                    await route_audio_command_burst(node_id, ["QUIET_PING", "PING"], 0.04)
+                else:
+                    await route_audio_command(node_id, "QUIET_PING")
+            return
+        if feature == "loud_siren_test":
+            if enabled:
+                if node_id in AUDIO_RELIABILITY_NODES:
+                    await route_audio_command_burst(
+                        node_id,
+                        ["PING", "SIREN", "SIREN", "SIREN", "PING", "SIREN"],
+                        0.08,
+                    )
+                else:
+                    await route_audio_command(node_id, "SIREN")
             return
         if feature == "mic":
             if enabled:
@@ -119,6 +141,14 @@ async def route_audio_command(node_id: str, command: str) -> None:
         logging.info("[AUDIO COMMAND] Sent %s to %s", command, node_id)
     except Exception as exc:
         logging.error("[AUDIO COMMAND] Failed %s to %s: %s", command, node_id, exc)
+
+
+async def route_audio_command_burst(node_id: str, commands: list[str], interval_seconds: float = 0.05) -> None:
+    """Send a short command burst for nodes that intermittently miss one-shot audio triggers."""
+    for idx, command in enumerate(commands):
+        await route_audio_command(node_id, command)
+        if idx < len(commands) - 1 and interval_seconds > 0:
+            await asyncio.sleep(interval_seconds)
 
 
 def process_zone_hysteresis(zone_id: str, mac_address: str, rssi_sample: float) -> dict:
