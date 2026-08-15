@@ -21,6 +21,25 @@ LIGHTHOUSE_TO_NODE = {
   "FSS-N04": "FSS-N04",
 }
 
+# Node 3-D positions (Three.js units; 1 unit = 1 foot) for RF fusion centroid
+NODE_POSITIONS: dict = {
+    "FSS-N01": (-10.0, 5.0, -10.0),
+    "FSS-N02": (10.0, 5.0, -10.0),
+    "FSS-N03": (-10.0, 5.0, 10.0),
+    "FSS-N04": (10.0, 5.0, 10.0),
+}
+NODE_COMPASS: dict = {"FSS-N01": "NORTH", "FSS-N02": "EAST", "FSS-N03": "SOUTH", "FSS-N04": "WEST"}
+
+# RF visualization parameters — initial values, not thesis-validated physical measurements
+RF_ALPHA: float = 0.20
+RF_R_MIN: float = 2.0               # minimum confidence sphere radius (ft)
+RF_R_MAX: float = 20.0              # maximum confidence sphere radius (ft)
+RF_DISTURBANCE_THRESHOLD: float = 8.0    # dB from baseline before confidence rises
+RF_DISTURBANCE_SCALE: float = 15.0       # dB range mapping 0→1 confidence
+RF_CONFIRM_THRESHOLD: float = 0.50       # smoothed confidence level for CONFIRMING_TARGET
+RF_BUZZER_COOLDOWN_S: float = 3.0        # minimum seconds between per-node RF buzzer events
+RF_MIN_FUSION_WEIGHT: float = 0.30       # minimum sum(C_i) to compute fusion centroid
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -73,6 +92,16 @@ def build_node_state(node_id: str) -> dict:
     "intercom_manual_off_latch": False,
     "auto_alert_engaged": False,
     "last_packet": None,
+    # RF disturbance model (confidence 0→1; not measured physical distance)
+    "rf_baseline": None,
+    "rf_confidence_raw": 0.0,
+    "rf_confidence_smooth": 0.0,
+    "rf_sphere_radius": RF_R_MIN,
+    "rf_state": "NORMAL",
+    "rf_last_buzzer_at": 0.0,
+    # Directional inference — deferred; UNKNOWN until spatial evidence supports it
+    "direction": "UNKNOWN",
+    "direction_confidence": 0.0,
   }
 
 
@@ -88,6 +117,13 @@ def build_initial_state() -> dict:
     },
     "latest_packet": None,
     "nodes": [build_node_state(node_id) for node_id in NODE_ORDER],
+    "rf_fusion": {
+        "state": "NO_FUSION",
+        "confidence": 0.0,
+        "position": None,
+        "active_nodes": [],
+        "dominant_node": None,
+    },
   }
 
 
@@ -119,6 +155,7 @@ def snapshot_state(message: str | None = None) -> dict:
     "hub": dict(dashboard_state["hub"]),
     "latest_packet": dashboard_state["latest_packet"],
     "nodes": [dict(node) for node in dashboard_state["nodes"]],
+    "rf_fusion": dict(dashboard_state.get("rf_fusion", {})),
   }
   if message is not None:
     payload["message"] = message
@@ -138,6 +175,87 @@ async def broadcast_state(message: str | None = None) -> None:
 
   for connection in dead_connections:
     dashboard_clients.discard(connection)
+
+
+def update_rf_state(node: dict, rssi_value: float | None) -> None:
+  """Update per-node RF confidence, sphere radius, and rf_state using EMA disturbance model.
+
+  C_raw = clamp((|rssi - baseline| - threshold) / scale, 0, 1)
+  C_smooth = alpha * C_raw + (1 - alpha) * C_prev
+  R = R_min + C_smooth * (R_max - R_min)
+  """
+  if rssi_value is None:
+    return
+
+  meta = ZONE_TOPOLOGY.get(node["node_id"], {})
+  threshold = float(meta.get("rf_disturbance_threshold", RF_DISTURBANCE_THRESHOLD))
+  scale = float(meta.get("rf_disturbance_scale", RF_DISTURBANCE_SCALE))
+
+  if node["rf_baseline"] is None:
+    node["rf_baseline"] = rssi_value
+    return
+
+  # Baseline adapts slowly only while NORMAL to avoid chasing an active disturbance
+  if node["rf_state"] == "NORMAL":
+    node["rf_baseline"] = node["rf_baseline"] * 0.98 + rssi_value * 0.02
+
+  d = abs(rssi_value - node["rf_baseline"])
+  c_raw = max(0.0, min(1.0, (d - threshold) / max(scale, 1e-6)))
+  c_prev = float(node.get("rf_confidence_smooth", 0.0))
+  c_smooth = RF_ALPHA * c_raw + (1.0 - RF_ALPHA) * c_prev
+
+  node["rf_confidence_raw"] = round(c_raw, 4)
+  node["rf_confidence_smooth"] = round(c_smooth, 4)
+  node["rf_sphere_radius"] = round(RF_R_MIN + c_smooth * (RF_R_MAX - RF_R_MIN), 2)
+  node["rf_state"] = "CONFIRMING_TARGET" if c_smooth >= RF_CONFIRM_THRESHOLD else "NORMAL"
+
+
+def compute_rf_fusion(nodes: list) -> dict:
+  """Weighted spatial centroid from per-node RF confidence.
+
+  X = sum(C_i * X_i) / sum(C_i), same for Y and Z.
+  Only computed when sum(C_i) >= RF_MIN_FUSION_WEIGHT.
+  """
+  total_weight = 0.0
+  wx = wy = wz = 0.0
+  active: list = []
+  dominant_node = None
+  dominant_conf = 0.0
+
+  for node in nodes:
+    nid = node["node_id"]
+    pos = NODE_POSITIONS.get(nid)
+    if pos is None:
+      continue
+    c = float(node.get("rf_confidence_smooth", 0.0))
+    if c <= 0.0:
+      continue
+    wx += c * pos[0]
+    wy += c * pos[1]
+    wz += c * pos[2]
+    total_weight += c
+    active.append(nid)
+    if c > dominant_conf:
+      dominant_conf = c
+      dominant_node = nid
+
+  if total_weight < RF_MIN_FUSION_WEIGHT:
+    return {
+      "state": "NO_FUSION",
+      "confidence": round(total_weight, 4),
+      "position": None,
+      "active_nodes": [],
+      "dominant_node": None,
+    }
+
+  n = max(len(active), 1)
+  return {
+    "state": "ACTIVE",
+    "confidence": round(total_weight / n, 4),
+    "position": [round(wx / total_weight, 2), round(wy / total_weight, 2), round(wz / total_weight, 2)],
+    "active_nodes": active,
+    "dominant_node": dominant_node,
+  }
 
 
 def update_motion_state(node: dict, packet: dict) -> None:
@@ -270,6 +388,7 @@ def update_motion_state(node: dict, packet: dict) -> None:
   node["last_seen"] = datetime.now().isoformat()
   node["source"] = zone_data.get("lighthouse") or raw.get("node_name") or raw.get("node_id") or "unknown"
   node["last_packet"] = packet
+  update_rf_state(node, rssi_value)
 
 
 def apply_telemetry_packet(packet: dict) -> str | None:
@@ -289,6 +408,7 @@ def apply_telemetry_packet(packet: dict) -> str | None:
     return None
 
   update_motion_state(node, packet)
+  dashboard_state["rf_fusion"] = compute_rf_fusion(dashboard_state["nodes"])
   dashboard_state["hub"] = {
     "connected": True,
     "last_seen": datetime.now().isoformat(),
@@ -476,6 +596,21 @@ HTML_PAGE = """
       #nodeCardBar { max-height:none; }
     }
     @media (max-width: 720px) { html { font-size: 15px; } .shell { padding:10px; } }
+    /* Phase 6 — per-node RF card styles */
+    .node-header { display:flex; align-items:baseline; justify-content:space-between; gap:8px; margin-bottom:5px; }
+    .compass-badge { font-size:.60rem; color:var(--amber); letter-spacing:.14em; text-transform:uppercase; border:1px solid rgba(255,209,102,.35); border-radius:4px; padding:1px 5px; }
+    .rf-data-row, .tf-data-row, .last-event-row { font-size:.68rem; display:flex; align-items:center; gap:5px; flex-wrap:wrap; margin-bottom:3px; padding:4px 6px; border-radius:6px; background:rgba(6,14,10,.72); border:1px solid rgba(57,255,20,.10); }
+    .data-label { color:var(--muted); letter-spacing:.08em; text-transform:uppercase; font-size:.60rem; min-width:52px; }
+    .data-sep { color:rgba(255,255,255,.18); margin:0 2px; }
+    .rf-field-val { color:var(--neon); font-variant-numeric:tabular-nums; min-width:34px; font-size:.72rem; }
+    .rf-sphere-val { color:var(--cyan); letter-spacing:.06em; text-transform:uppercase; font-size:.62rem; }
+    .rf-sphere-val.confirming { color:var(--amber); text-shadow:0 0 8px rgba(255,209,102,.5); }
+    .tf-luna-val { color:var(--neon); font-size:.70rem; font-variant-numeric:tabular-nums; }
+    .last-event-row { border-color:rgba(68,215,255,.08); }
+    .last-event-val { color:var(--cyan); font-size:.62rem; }
+    .node-buttons { display:grid; gap:4px; margin-bottom:4px; }
+    .intercom-future-btn { opacity:0.38; cursor:not-allowed !important; }
+    .intercom-future-btn:hover { opacity:0.38; }
   </style>
 </head>
 <body>
@@ -489,23 +624,10 @@ HTML_PAGE = """
           <div id=\"canvas-container\"></div>          <div id="nodeCardBar"></div>        </div>
         <div class=\"telemetry-grid\">
           <div class=\"card\"><h3>Node Status</h3><table><thead><tr><th>Node</th><th>Motion</th><th>Signal</th><th>State</th><th>Last</th></tr></thead><tbody id=\"rows\"></tbody></table></div>
+          <div class=\"card\"><h3>RF Diagnostics</h3><pre id=\"rfDiag\" style=\"font-size:.62rem;color:#d8ffe0;line-height:1.50;max-height:140px;overflow:auto\">\u2014</pre></div>
         </div>
       </div>
       <div class=\"control-panel\">
-        <div class=\"status-card\"><h3>System Controls</h3><p>Confirming-target uses TF-Luna distance first and RSSI fallback when sensors are degraded.</p></div>
-        <div class="mode-switcher">
-          <div class="mode-switcher-title">Operating Mode</div>
-          <div class="mode-switcher-actions">
-            <button id="btn-mode-interactive" class="mode-button" type="button">Blue: Acoustic Subsystem</button>
-            <button id="btn-mode-automatic" class="mode-button" type="button">Green: Actions Automatic</button>
-          </div>
-          <div id="dashboardMode" class="mode-readout">Mode: Blue acoustic standby</div>
-        </div>
-        <div class=\"speaker-control-panel\">
-          <div class=\"speaker-control-title\">Acoustic Subsystem</div>
-          <button id="btn-siren-test" class="speaker-test-button" type="button">Blue Button: Cycle Beep</button>
-          <div id="speaker-status" class="speaker-status">Blue button cycles a beep</div>
-        </div>
         <div class=\"control-grid\" id=\"controlPanel\"></div>
       </div>
     </div>
@@ -520,10 +642,10 @@ HTML_PAGE = """
     const SENSOR_HEIGHT = 5; // 5-foot tripod mount
     
     const ROOMS = {
-      "FSS-N01": { id: "FSS-N01", name: "OFFICE",      center: [-10, 0, -10], color: 0x00ff88 },
-      "FSS-N02": { id: "FSS-N02", name: "GARAGE",      center: [10, 0, -10],  color: 0x3399ff },
-      "FSS-N03": { id: "FSS-N03", name: "BABY'S ROOM", center: [-10, 0, 10],  color: 0xa0a0a0 },
-      "FSS-N04": { id: "FSS-N04", name: "ENTRYWAY",    center: [10, 0, 10],   color: 0xffd700 }
+      "FSS-N01": { id: "FSS-N01", name: "OFFICE",      compass: "NORTH", center: [-10, 0, -10], color: 0x00ff88 },
+      "FSS-N02": { id: "FSS-N02", name: "GARAGE",      compass: "EAST",  center: [10, 0, -10],  color: 0x3399ff },
+      "FSS-N03": { id: "FSS-N03", name: "BABY'S ROOM", compass: "SOUTH", center: [-10, 0, 10],  color: 0xa0a0a0 },
+      "FSS-N04": { id: "FSS-N04", name: "ENTRYWAY",    compass: "WEST",  center: [10, 0, 10],   color: 0xffd700 }
     };
     
     let scene, camera, renderer, orbitControls;
@@ -541,6 +663,9 @@ HTML_PAGE = """
     let latestDashboardState = null;
     let audioContext = null;
     let speakerSequenceRunning = false;
+    const lastRfState = {};        // nodeId -> previous rf_state for buzzer transition
+    const rfBuzzerCooldownAt = {}; // nodeId -> ms timestamp of last RF buzzer
+    const lastEvents = {};         // nodeId -> last event string for card display
 
     function getAudioContext() {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -611,6 +736,26 @@ HTML_PAGE = """
       toneB.connect(gain);
       toneB.start(now + 0.15);
       toneB.stop(now + 0.30);
+    }
+
+    // RF guard buzzer — fires once per NORMAL→CONFIRMING_TARGET transition (3s cooldown)
+    async function playRfBuzzer() {
+      const ctx = getAudioContext();
+      if (!ctx) return;
+      if (ctx.state === 'suspended') { try { await ctx.resume(); } catch { return; } }
+      const now = ctx.currentTime;
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.linearRampToValueAtTime(0.15, now + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 1.0);
+      gain.connect(ctx.destination);
+      const osc = ctx.createOscillator();
+      osc.type = 'square';
+      osc.frequency.setValueAtTime(180, now);
+      osc.frequency.setValueAtTime(360, now + 0.5);
+      osc.connect(gain);
+      osc.start(now);
+      osc.stop(now + 1.0);
     }
 
     function triggerPhaseTracer(nodeId, mode = 'CONFIRMING_TARGET') {
@@ -728,11 +873,44 @@ HTML_PAGE = """
       initThreeJS();
       threeInitialized = true;
     }
+
+    function renderSceneError(message) {
+      const container = document.getElementById('canvas-container');
+      if (!container) return;
+      container.innerHTML = '';
+      const panel = document.createElement('div');
+      panel.style.margin = '14px';
+      panel.style.padding = '12px';
+      panel.style.border = '1px solid rgba(255,209,102,0.5)';
+      panel.style.borderRadius = '10px';
+      panel.style.background = 'rgba(27,18,0,0.55)';
+      panel.style.color = '#ffd166';
+      panel.style.fontSize = '0.78rem';
+      panel.style.lineHeight = '1.45';
+      panel.innerHTML = `<strong>3D scene unavailable.</strong><br>${message}`;
+      container.appendChild(panel);
+      const status = document.getElementById('status');
+      if (status) {
+        status.textContent = '3D unavailable - check Chromium GPU/WebGL flags';
+      }
+    }
     
     function initThreeJS() {
       const container = document.getElementById('canvas-container');
       const width = container.clientWidth;
       const height = container.clientHeight;
+
+      if (!window.THREE) {
+        renderSceneError('Three.js did not load. Verify network access to CDN or bundle vendor scripts locally.');
+        return;
+      }
+
+      const webglProbe = document.createElement('canvas');
+      const webglOk = !!(webglProbe.getContext('webgl') || webglProbe.getContext('experimental-webgl'));
+      if (!webglOk) {
+        renderSceneError('WebGL is disabled in Chromium. On Jetson try: chromium --ignore-gpu-blocklist --enable-gpu-rasterization --use-gl=egl');
+        return;
+      }
       
       scene = new THREE.Scene();
       scene.background = new THREE.Color(0x030605);
@@ -742,7 +920,12 @@ HTML_PAGE = """
       camera.position.set(0, 38, 42);
       camera.lookAt(0, 0, 0);
       
-      renderer = new THREE.WebGLRenderer({ antialias: true });
+      try {
+        renderer = new THREE.WebGLRenderer({ antialias: true });
+      } catch (error) {
+        renderSceneError('Chromium could not initialize WebGLRenderer. Ensure GPU acceleration is enabled for Jetson display output.');
+        return;
+      }
       renderer.setSize(width, height);
       renderer.setPixelRatio(window.devicePixelRatio);
       renderer.shadowMap.enabled = true;
@@ -835,6 +1018,18 @@ HTML_PAGE = """
         phaseBox.userData.mode = 'CLEAR';
         nodeGroup.add(phaseBox);
         room.phaseBox = phaseBox;
+
+        // RF confidence wireframe box — direction UNKNOWN; expands with RF disturbance confidence
+        const rfBoxGeo = new THREE.BoxGeometry(3, 3, 3);
+        const rfBoxMat = new THREE.MeshBasicMaterial({ color: 0xffd700, wireframe: true, transparent: true, opacity: 0.0 });
+        const rfBox = new THREE.Mesh(rfBoxGeo, rfBoxMat);
+        rfBox.position.set(0, 1.5, 0);
+        rfBox.userData.rfState = 'NORMAL';
+        rfBox.userData.rfConfidence = 0.0;
+        rfBox.userData.rfRadius = 2.0;
+        rfBox.userData.direction = 'UNKNOWN';
+        nodeGroup.add(rfBox);
+        room.rfBox = rfBox;
       });
       
       // DIMENSION LABEL
@@ -898,6 +1093,27 @@ HTML_PAGE = """
         }
       });
 
+      // RF confidence box animation — yellow wireframe, direction always UNKNOWN for now
+      Object.values(ROOMS).forEach((room) => {
+        const rfBox = room.rfBox;
+        if (!rfBox) return;
+        const rfState = rfBox.userData.rfState || 'NORMAL';
+        const rfConf = rfBox.userData.rfConfidence || 0.0;
+        const rfRadius = rfBox.userData.rfRadius || 2.0;
+        if (rfState === 'CONFIRMING_TARGET') {
+          rfBox.material.color.setHex(0xffe44a);
+          rfBox.material.opacity = 0.38 + Math.abs(Math.sin(animTime * 3.0)) * 0.40;
+        } else if (rfConf > 0.05) {
+          rfBox.material.color.setHex(0xffd700);
+          rfBox.material.opacity = 0.05 + rfConf * 0.22;
+        } else {
+          rfBox.material.opacity = Math.max(0.0, rfBox.material.opacity - 0.04);
+        }
+        const boxScale = Math.max(0.33, rfRadius / 6.0);
+        rfBox.scale.set(boxScale, boxScale, boxScale);
+        rfBox.rotation.y += 0.007;
+      });
+
       orbitControls.update();
       renderer.render(scene, camera);
     }
@@ -932,44 +1148,43 @@ HTML_PAGE = """
 
       const sphere = room.sphereMesh;
       const pointLight = room.pointLight;
-      const baseColor = room.color;
       const hasFreshData = node.last_seen && (Date.now() - new Date(node.last_seen).getTime()) < 5000;
-      const isActive = Boolean(node.motion);
-      const isConfirming = node.motion_label === 'CONFIRMING_TARGET';
       const isPredator = node.motion_label === 'PREDATOR_DETECTED';
+      const rfState = node.rf_state || 'NORMAL';
+      const rfRadius = node.rf_sphere_radius != null ? node.rf_sphere_radius : 2.0;
+      const rfConf = node.rf_confidence_smooth || 0.0;
       const controlActive = sphere.userData.controlUntil && Date.now() < sphere.userData.controlUntil;
       const sirenActive = Boolean(node.siren_on);
-      const intercomActive = Boolean(node.intercom_on);
 
-      sphere.material.color.setHex(baseColor);
+      // RF confidence drives sphere scale (base geometry radius = 6 ft)
+      sphere.userData.dynamicScale = Math.max(0.33, rfRadius / 6.0);
+      sphere.material.color.setHex(room.color);
+
       if (controlActive && sirenActive) {
         sphere.material.opacity = 0.48;
-        sphere.userData.dynamicScale = 1.56;
-      } else if (controlActive && intercomActive) {
-        sphere.material.opacity = 0.34;
-        sphere.userData.dynamicScale = 1.32;
-      } else if (controlActive) {
-        sphere.material.opacity = 0.28;
-        sphere.userData.dynamicScale = 1.22;
+        sphere.userData.dynamicScale = Math.max(sphere.userData.dynamicScale, 1.56);
       } else if (isPredator) {
         sphere.material.opacity = 0.42;
-        sphere.userData.dynamicScale = 1.48;
-      } else if (isConfirming) {
-        sphere.material.opacity = 0.30;
-        sphere.userData.dynamicScale = 1.28;
-      } else if (node.sensor_ok) {
-        sphere.material.opacity = isActive ? 0.24 : 0.12;
-        sphere.userData.dynamicScale = 1.04;
+        sphere.userData.dynamicScale = Math.max(sphere.userData.dynamicScale, 1.48);
+      } else if (rfState === 'CONFIRMING_TARGET') {
+        sphere.material.opacity = 0.26;
       } else if (hasFreshData) {
-        sphere.material.opacity = 0.08;
-        sphere.userData.dynamicScale = 0.98;
+        sphere.material.opacity = rfConf > 0.05 ? 0.18 : 0.12;
       } else {
         sphere.material.opacity = 0.04;
-        sphere.userData.dynamicScale = 0.92;
+        sphere.userData.dynamicScale = 0.33;
       }
 
       if (pointLight) {
-        pointLight.intensity = controlActive ? (sirenActive ? 3.2 : 2.0) : isPredator ? 2.9 : isConfirming ? 2.1 : (hasFreshData ? 0.9 : 0.35);
+        pointLight.intensity = sirenActive ? 3.2 : isPredator ? 2.9 : rfState === 'CONFIRMING_TARGET' ? 2.0 : hasFreshData ? 0.9 : 0.35;
+      }
+
+      // Push RF data into the rfBox for the animate loop
+      if (room.rfBox) {
+        room.rfBox.userData.rfState = rfState;
+        room.rfBox.userData.rfConfidence = rfConf;
+        room.rfBox.userData.rfRadius = rfRadius;
+        room.rfBox.userData.direction = node.direction || 'UNKNOWN';
       }
     }
     
@@ -1049,66 +1264,56 @@ HTML_PAGE = """
     function ensureNodeControls(nodes) {
       for (const node of nodes) {
         if (!nodeControlBindings[node.node_id]) {
+          const compass = ROOMS[node.node_id]?.compass || '';
           const nodeControl = document.createElement('div');
           nodeControl.className = 'node-control';
 
-          const title = document.createElement('h4');
-          title.textContent = `${node.node_id} · ${node.label}`;
+          // Header: node ID + compass direction
+          nodeControl.innerHTML = `
+            <div class=\"node-header\">
+              <h4 style=\"margin:0;font-size:.78rem;letter-spacing:.08em\">${node.node_id}</h4>
+              <span class=\"compass-badge\">${compass}</span>
+            </div>
+            <div class=\"rf-data-row\">
+              <span class=\"data-label\">RF FIELD</span>
+              <span class=\"rf-field-val\" id=\"rfv-${node.node_id}\">0.00</span>
+              <span class=\"data-sep\">\u00b7</span>
+              <span class=\"data-label\">SPHERE</span>
+              <span class=\"rf-sphere-val\" id=\"rfs-${node.node_id}\">NORMAL</span>
+            </div>
+            <div class=\"tf-data-row\">
+              <span class=\"data-label\">TF-LUNA</span>
+              <span class=\"tf-luna-val\" id=\"tfl-${node.node_id}\">READY</span>
+            </div>
+            <div class=\"node-buttons\" id=\"btns-${node.node_id}\"></div>
+            <div class=\"last-event-row\">Last Event: <span class=\"last-event-val\" id=\"lev-${node.node_id}\">\u2014</span></div>
+          `;
+          controlPanelEl.appendChild(nodeControl);
 
-          const meta = document.createElement('div');
-          meta.className = 'node-meta';
-          const pill = document.createElement('span');
-          pill.className = 'node-pill';
-          const source = document.createElement('span');
-          meta.appendChild(pill);
-          meta.appendChild(source);
-
-          const controls = document.createElement('div');
-          controls.className = 'control-grid';
+          const btnsContainer = nodeControl.querySelector(`#btns-${node.node_id}`);
 
           const micButton = document.createElement('button');
           micButton.className = 'control-button';
           micButton.addEventListener('click', () => {
             const current = nodeControlBindings[node.node_id]?.state;
-            const enabled = !(current && current.mic_enabled);
-            sendControl(node.node_id, 'mic', enabled);
+            sendControl(node.node_id, 'mic', !(current && current.mic_enabled));
           });
 
           const sirenButton = document.createElement('button');
           sirenButton.className = 'guard-siren-button';
           sirenButton.addEventListener('click', () => {
-            // Siren is an operator-triggered one-shot command.
             sendControl(node.node_id, 'siren', true);
           });
 
-          const loudSirenButton = document.createElement('button');
-          loudSirenButton.className = 'guard-siren-button';
-          loudSirenButton.addEventListener('click', () => {
-            sendControl(node.node_id, 'loud_siren_test', true);
-          });
-
+          // Intercom: FUTURE USE — no click handler, visually distinct
           const intercomButton = document.createElement('button');
-          intercomButton.className = 'control-button';
-          intercomButton.addEventListener('click', () => {
-            const current = nodeControlBindings[node.node_id]?.state;
-            sendControl(node.node_id, 'intercom', !Boolean(current?.intercom_on));
-          });
+          intercomButton.className = 'control-button intercom-future-btn';
+          intercomButton.disabled = true;
+          intercomButton.innerHTML = 'INTERCOM<small>Future use \u2014 not yet active</small>';
 
-          const pingButton = document.createElement('button');
-          pingButton.className = 'control-button';
-          pingButton.addEventListener('click', () => {
-            sendControl(node.node_id, 'quiet_ping', true);
-          });
-
-          controls.appendChild(micButton);
-          controls.appendChild(sirenButton);
-          controls.appendChild(loudSirenButton);
-          controls.appendChild(intercomButton);
-          controls.appendChild(pingButton);
-          nodeControl.appendChild(title);
-          nodeControl.appendChild(meta);
-          nodeControl.appendChild(controls);
-          controlPanelEl.appendChild(nodeControl);
+          btnsContainer.appendChild(micButton);
+          btnsContainer.appendChild(sirenButton);
+          btnsContainer.appendChild(intercomButton);
 
           const row = document.createElement('tr');
           const colNode = document.createElement('td');
@@ -1123,7 +1328,7 @@ HTML_PAGE = """
           row.appendChild(colLast);
           rowsEl.appendChild(row);
 
-          nodeControlBindings[node.node_id] = { nodeControl, pill, source, micButton, sirenButton, loudSirenButton, intercomButton, pingButton, state: null };
+          nodeControlBindings[node.node_id] = { nodeControl, micButton, sirenButton, intercomButton, state: null };
           nodeRowBindings[node.node_id] = { colNode, colMotion, colSignal, colState, colLast };
         }
       }
@@ -1132,42 +1337,50 @@ HTML_PAGE = """
     function updateNodeControl(node) {
       const ui = nodeControlBindings[node.node_id];
       if (!ui) return;
-
       ui.state = node;
-      ui.pill.textContent = formatMotionLabel(node.motion_label);
-      const audioStamp = node.last_audio_cmd && node.last_audio_cmd !== 'NONE'
-        ? `audio:${node.last_audio_cmd}`
-        : 'audio:none';
-      ui.source.textContent = `${node.source} · ${audioStamp}`;
 
       const lastSeenMs = node.last_seen ? new Date(node.last_seen).getTime() : 0;
       const online = Boolean(lastSeenMs) && (Date.now() - lastSeenMs) <= 10000;
 
+      // RF row
+      const rfFieldEl = document.getElementById(`rfv-${node.node_id}`);
+      const rfSphereEl = document.getElementById(`rfs-${node.node_id}`);
+      if (rfFieldEl) rfFieldEl.textContent = (node.rf_confidence_smooth ?? 0).toFixed(2);
+      if (rfSphereEl) {
+        const rfState = node.rf_state || 'NORMAL';
+        rfSphereEl.textContent = rfState;
+        rfSphereEl.className = rfState === 'CONFIRMING_TARGET' ? 'rf-sphere-val confirming' : 'rf-sphere-val';
+      }
+
+      // TF-Luna row
+      const tfEl = document.getElementById(`tfl-${node.node_id}`);
+      if (tfEl) {
+        if (!online) {
+          tfEl.textContent = 'OFFLINE';
+        } else if (node.distance_cm != null && node.distance_cm >= 0) {
+          tfEl.textContent = `${node.distance_cm} cm`;
+        } else {
+          tfEl.textContent = 'READY';
+        }
+      }
+
+      // Mic button
       const micEnabled = online ? Boolean(node.mic_enabled) : false;
       ui.micButton.disabled = !online;
       ui.micButton.dataset.active = String(micEnabled);
-      ui.micButton.innerHTML = `${micEnabled ? 'Mic Unmute' : 'Mic Mute'}<small>${online ? `Mic sensor state for ${node.label}.` : 'Offline: no recent telemetry'}</small>`;
+      ui.micButton.innerHTML = `\uD83C\uDFA4 MIC: ${micEnabled ? 'UNMUTED' : 'MUTED'}<small>${online ? '' : ' \u2014 offline'}</small>`;
 
-      ui.sirenButton.disabled = !online;
-      const loudTestAllowed = node.node_id === 'FSS-N03' || node.node_id === 'FSS-N04';
-      ui.loudSirenButton.disabled = !online || !loudTestAllowed;
-      ui.loudSirenButton.style.display = loudTestAllowed ? '' : 'none';
-      ui.intercomButton.disabled = !online;
-      ui.pingButton.disabled = !online;
-
+      // Siren button
       const sirenState = online ? Boolean(node.siren_on) : false;
+      ui.sirenButton.disabled = !online;
       ui.sirenButton.dataset.active = String(sirenState);
-      ui.sirenButton.innerHTML = `${sirenState ? 'Actions Automatic' : 'Sirens Disabled'}<small>${online ? (sirenState ? `Automatic response active for ${node.label}. Security guard can click to return to silence.` : `Ready for ${node.label}. Predator alerts will light the button and beep.`) : 'Offline: no recent telemetry'}</small>`;
+      ui.sirenButton.innerHTML = `\uD83D\uDD0A SIREN: ${sirenState ? 'ACTIVE' : 'OFF'}<small>${sirenState ? 'Click to silence' : (online ? 'Ready' : '\u2014 offline')}</small>`;
 
-      ui.loudSirenButton.dataset.active = 'false';
-      ui.loudSirenButton.innerHTML = `Loud Siren Test<small>${online ? (loudTestAllowed ? `Temporary long burst test for ${node.label}.` : 'Available only on N03/N04 for troubleshooting') : 'Offline: no recent telemetry'}</small>`;
-
-      const intercomState = online ? Boolean(node.intercom_on) : false;
-      ui.intercomButton.dataset.active = String(intercomState);
-      ui.intercomButton.innerHTML = `${intercomState ? 'Intercom On' : 'Intercom Off'}<small>${online ? `Two-way talkback for ${node.label}.` : 'Offline: no recent telemetry'}</small>`;
-
-      ui.pingButton.dataset.active = 'false';
-      ui.pingButton.innerHTML = `Quiet Ping<small>${online ? `Detection notification ping for ${node.label}.` : 'Offline: no recent telemetry'}</small>`;
+      // Last event
+      const levEl = document.getElementById(`lev-${node.node_id}`);
+      if (levEl && lastEvents[node.node_id]) {
+        levEl.textContent = lastEvents[node.node_id];
+      }
     }
 
     function updateNodeRow(node) {
@@ -1211,14 +1424,31 @@ HTML_PAGE = """
         if (enteringAlert) {
           triggerPhaseTracer(node.node_id, node.motion_label);
 
-          // Attention nudge at the dashboard display (Roku/desk), not on node speaker.
+          // TF-Luna chime — fires on TF-Luna-based state transition
           const now = Date.now();
           const lastPing = lastDashboardPingAt[node.node_id] || 0;
           if (now - lastPing > 4000) {
             lastDashboardPingAt[node.node_id] = now;
             playDashboardQuietPing();
+            const ts = new Date().toLocaleTimeString();
+            lastEvents[node.node_id] = `TF-LUNA ${node.motion_label} \u00b7 ${ts}`;
           }
         }
+
+        // RF guard buzzer — fires once on NORMAL → CONFIRMING_TARGET RF transition
+        const prevRfState = lastRfState[node.node_id] || 'NORMAL';
+        const currRfState = node.rf_state || 'NORMAL';
+        if (prevRfState === 'NORMAL' && currRfState === 'CONFIRMING_TARGET') {
+          const now = Date.now();
+          const lastBuzz = rfBuzzerCooldownAt[node.node_id] || 0;
+          if (now - lastBuzz >= 3000) {
+            rfBuzzerCooldownAt[node.node_id] = now;
+            playRfBuzzer();
+            const ts = new Date().toLocaleTimeString();
+            lastEvents[node.node_id] = `RF CONFIRMING_TARGET \u00b7 ${ts}`;
+          }
+        }
+        lastRfState[node.node_id] = currRfState;
 
         lastNodeVisualState[node.node_id] = node.motion_label;
         updateNodeControl(node);
@@ -1230,6 +1460,32 @@ HTML_PAGE = """
       const latestRaw = state.latest_packet?.zone_data?.raw_telemetry;
       if (latestRaw && latestRaw.node_id) {
         updateNodeCard(latestRaw.node_id, latestRaw);
+      }
+
+      // RF diagnostics developer panel
+      const rfDiagEl = document.getElementById('rfDiag');
+      if (rfDiagEl) {
+        const lines = ['NODE     CONF   STATE'];
+        lines.push('\u2500'.repeat(32));
+        for (const node of nodes) {
+          const conf = (node.rf_confidence_smooth ?? 0).toFixed(3);
+          const rfState = (node.rf_state || 'NORMAL').padEnd(18);
+          lines.push(`${node.node_id.padEnd(8)} ${conf}  ${rfState}`);
+        }
+        lines.push('');
+        const fusion = state.rf_fusion;
+        if (fusion) {
+          lines.push(`FUSION : ${fusion.state}`);
+          if (fusion.position) {
+            lines.push(`  X ${fusion.position[0].toFixed(1).padStart(6)}  Y ${fusion.position[1].toFixed(1).padStart(5)}  Z ${fusion.position[2].toFixed(1).padStart(6)}`);
+          }
+          lines.push(`  CONF     ${(fusion.confidence ?? 0).toFixed(3)}`);
+          if (fusion.active_nodes?.length) {
+            lines.push(`  ACTIVE   ${fusion.active_nodes.join(', ')}`);
+            lines.push(`  DOMINANT ${fusion.dominant_node || '\u2014'}`);
+          }
+        }
+        rfDiagEl.textContent = lines.join('\n');
       }
     }
 

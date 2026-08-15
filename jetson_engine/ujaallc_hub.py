@@ -50,12 +50,40 @@ HYSTERESIS_CONFIG = {
 active_locks: Dict[str, dict] = {}
 visualizer_clients: Set[object] = set()
 active_serial_ports: Dict[str, serial.Serial] = {}
+active_serial_path_owner: Dict[str, str] = {}
 AUDIO_RELIABILITY_NODES = {"FSS-N03", "FSS-N04"}
+
+
+def _canonical_serial_path(port_path: str) -> str:
+    """Normalize a serial path so by-id symlinks and /dev/ttyACM* compare equally."""
+    try:
+        return str(Path(port_path).resolve())
+    except Exception:
+        return port_path
+
+
+def _claim_serial_path(node_name: str, port_path: str) -> bool:
+    canonical = _canonical_serial_path(port_path)
+    owner = active_serial_path_owner.get(canonical)
+    if owner is not None and owner != node_name:
+        return False
+    active_serial_path_owner[canonical] = node_name
+    return True
+
+
+def _release_serial_path(node_name: str, port_path: str) -> None:
+    canonical = _canonical_serial_path(port_path)
+    if active_serial_path_owner.get(canonical) == node_name:
+        active_serial_path_owner.pop(canonical, None)
 
 
 def resolve_available_port(node_name: str) -> str | None:
     for candidate in ZONE_PORTS.get(node_name, []):
         if Path(candidate).exists():
+            canonical = _canonical_serial_path(candidate)
+            owner = active_serial_path_owner.get(canonical)
+            if owner is not None and owner != node_name:
+                continue
             return candidate
     return None
 
@@ -197,6 +225,17 @@ async def serial_endpoint_handler(node_name: str) -> None:
             await asyncio.sleep(SERIAL_RETRY_DELAY_SECONDS)
             continue
 
+        if not _claim_serial_path(node_name, port_path):
+            owner = active_serial_path_owner.get(_canonical_serial_path(port_path), "another node")
+            logging.warning(
+                "[WAIT] %s waiting for %s (currently owned by %s)",
+                node_name,
+                port_path,
+                owner,
+            )
+            await asyncio.sleep(SERIAL_RETRY_DELAY_SECONDS)
+            continue
+
         try:
             ser = serial.Serial(port_path, HUB_SERIAL_BAUD_RATE, timeout=1)
             active_serial_ports[node_name] = ser
@@ -252,6 +291,7 @@ async def serial_endpoint_handler(node_name: str) -> None:
                     ser.close()
             except Exception:
                 pass
+            _release_serial_path(node_name, port_path)
 
         await asyncio.sleep(SERIAL_RETRY_DELAY_SECONDS)
 
