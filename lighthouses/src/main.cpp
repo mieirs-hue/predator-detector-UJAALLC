@@ -34,6 +34,7 @@ const uint32_t I2C_CLOCK_HZ = 100000;
 const uint8_t LIDAR_READ_RETRIES = 3;
 const unsigned long INITIAL_DEBUG_SCAN_MS = 10000; // Continuously scan I2C for 10s on boot
 const unsigned long DEBUG_SCAN_INTERVAL_MS = 200;
+const unsigned long STARTUP_CHIME_REPLAY_MS = 3000;
 
 volatile bool newLidarDataReady = false;
 volatile int last_i2c_error = 0;
@@ -54,6 +55,7 @@ char last_audio_cmd[16] = "NONE";
 unsigned long last_audio_cmd_ms = 0;
 bool intercom_enabled = false;
 bool mic_enabled = false;
+bool startup_chime_replayed = false;
 
 // ── RF sensing ──────────────────────────────────────────────────────────────
 // WiFi RSSI: measures ambient 2.4 GHz field; changes with body absorption/reflection
@@ -66,6 +68,8 @@ static unsigned long rfBleWindowStart  = 0;
 static unsigned long rfWifiReconnectMs = 0;
 static BLEScan* rfBLEScan = nullptr;
 
+void playTone(int frequency, int duration_ms, float amplitudePct);
+
 class BleRssiCallback : public BLEAdvertisedDeviceCallbacks {
     void onResult(BLEAdvertisedDevice dev) override {
         int r = dev.getRSSI();
@@ -76,6 +80,18 @@ class BleRssiCallback : public BLEAdvertisedDeviceCallbacks {
 
 float scaledPingLevel(float baseLevel) {
     return constrain(baseLevel * PING_LEVEL_SCALE, 0.0f, 1.0f);
+}
+
+void playStartupChime() {
+    // Multi-tone chirp confirms the amp path is alive on boot and after delayed replay.
+    playTone(650, 110, 0.70f);
+    delay(40);
+    playTone(980, 110, 0.70f);
+    playTone(650, 80, 0.60f);
+    delay(80);
+    playTone(880, 80, 0.60f);
+    delay(80);
+    playTone(1200, 100, 0.70f);
 }
 
 void runI2CScan() {
@@ -392,16 +408,8 @@ void setup() {
     setupAudioOutput();
 
     if (audio_ready) {
-        // Startup chirp confirms amp path is alive immediately after boot.
-        playTone(650, 110, 0.70f);
-        delay(40);
-        playTone(980, 110, 0.70f);
-        // Distinct 3-tone startup chirp to confirm audio path is alive.
-        playTone(650, 80, 0.60f);
-        delay(80);
-        playTone(880, 80, 0.60f);
-        delay(80);
-        playTone(1200, 100, 0.70f);
+        // First startup chirp right after amp init.
+        playStartupChime();
     }
 
     Serial.printf("[%s] Ready.\n", NODE_NAME);
@@ -426,6 +434,12 @@ void loop() {
     checkSerialCommands();
 
     unsigned long now = millis();
+
+    if (audio_ready && !startup_chime_replayed && now >= STARTUP_CHIME_REPLAY_MS) {
+        // Replay boot chirp once after rails settle so slow-start amps are still audible.
+        playStartupChime();
+        startup_chime_replayed = true;
+    }
 
     // For the first 10s, repeatedly re-scan I2C at a controlled cadence.
     if (now < INITIAL_DEBUG_SCAN_MS && (now - last_debug_scan_ms) >= DEBUG_SCAN_INTERVAL_MS) {

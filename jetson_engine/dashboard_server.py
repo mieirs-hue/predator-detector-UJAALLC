@@ -48,6 +48,7 @@ RF_RANGE_SIGMA_FT: float = 5.0      # Gaussian ring uncertainty per range estima
 RF_GRID_CELLS: int = 8              # cells per side on 40×40 ft floor (8×8 = 64 cells)
 RF_CELL_FT: float = 40.0 / RF_GRID_CELLS   # = 5 ft per cell
 RF_MULTILATERATION_ITERS: int = 12  # gradient-descent iterations for position refinement
+TF_LUNA_RF_FALLBACK_ENABLED: bool = False  # RF isolation mode: do not synthesize RF from TF-Luna
 
 
 @asynccontextmanager
@@ -119,6 +120,7 @@ def build_initial_state() -> dict:
     "type": "dashboard_state",
     "updated_at": None,
     "operation_mode": "FULLY_INTERACTIVE",
+    "tf_luna_audio_enabled": False,
     "hub": {
       "connected": False,
       "last_seen": None,
@@ -150,6 +152,12 @@ def set_operation_mode(mode: str) -> dict | None:
   return dashboard_state
 
 
+def set_tf_luna_audio_enabled(enabled: bool) -> dict:
+  dashboard_state["tf_luna_audio_enabled"] = bool(enabled)
+  dashboard_state["updated_at"] = datetime.now().isoformat()
+  return dashboard_state
+
+
 def get_node_state(node_id: str) -> dict | None:
   for node in dashboard_state["nodes"]:
     if node["node_id"] == node_id:
@@ -161,6 +169,8 @@ def snapshot_state(message: str | None = None) -> dict:
   payload = {
     "type": "dashboard_state",
     "updated_at": datetime.now().isoformat(),
+    "operation_mode": dashboard_state.get("operation_mode", "FULLY_INTERACTIVE"),
+    "tf_luna_audio_enabled": bool(dashboard_state.get("tf_luna_audio_enabled", False)),
     "hub": dict(dashboard_state["hub"]),
     "latest_packet": dashboard_state["latest_packet"],
     "nodes": [dict(node) for node in dashboard_state["nodes"]],
@@ -420,6 +430,25 @@ def update_motion_state(node: dict, packet: dict) -> None:
   except (TypeError, ValueError):
     rssi_value = None
 
+  wifi_rssi = raw.get("wifi_rssi")
+  try:
+    wifi_rssi_value = float(wifi_rssi) if wifi_rssi is not None else None
+  except (TypeError, ValueError):
+    wifi_rssi_value = None
+
+  ble_rssi = raw.get("ble_rssi")
+  try:
+    ble_rssi_value = float(ble_rssi) if ble_rssi is not None else None
+  except (TypeError, ValueError):
+    ble_rssi_value = None
+
+  effective_rf_rssi = rssi_value
+  if effective_rf_rssi in {None, -99.0}:
+    if wifi_rssi_value not in {None, -99.0}:
+      effective_rf_rssi = wifi_rssi_value
+    elif ble_rssi_value not in {None, -99.0}:
+      effective_rf_rssi = ble_rssi_value
+
   mic_rms = raw.get("mic_rms")
   try:
     mic_rms_value = float(mic_rms) if mic_rms is not None else None
@@ -472,8 +501,8 @@ def update_motion_state(node: dict, packet: dict) -> None:
   elif sensor_status == "SENSOR_ERR" and not motion_active:
     motion_label = "SENSOR_ERR"
 
-  if not motion_active and rssi_value is not None:
-    motion_active = rssi_value >= float(node["baseline_rssi"]) + rssi_margin
+  if not motion_active and effective_rf_rssi is not None:
+    motion_active = effective_rf_rssi >= float(node["baseline_rssi"]) + rssi_margin
     if motion_active and motion_label == "CLEAR":
       motion_label = "CONFIRMING_TARGET"
 
@@ -512,7 +541,7 @@ def update_motion_state(node: dict, packet: dict) -> None:
     else "error" if motion_label == "SENSOR_ERR"
     else "idle"
   )
-  node["rssi"] = rssi_value
+  node["rssi"] = effective_rf_rssi
   node["strength"] = state.get("strength", 0)
   node["distance_cm"] = distance_value
   node["mic_rms"] = mic_rms_value
@@ -521,8 +550,8 @@ def update_motion_state(node: dict, packet: dict) -> None:
   node["audio_ready"] = bool(raw.get("audio_ready", False))
   node["last_audio_cmd"] = str(raw.get("last_audio_cmd", "NONE"))
   # Store WiFi and BLE RSSI separately for diagnostics and path-loss model
-  node["wifi_rssi"] = raw.get("wifi_rssi", rssi_value)
-  node["ble_rssi"] = raw.get("ble_rssi", -99)
+  node["wifi_rssi"] = wifi_rssi if wifi_rssi is not None else rssi_value
+  node["ble_rssi"] = ble_rssi if ble_rssi is not None else -99
   node["ble_count"] = int(raw.get("ble_count", 0) or 0)
   try:
     node["last_audio_cmd_ms"] = int(raw.get("last_audio_cmd_ms", 0) or 0)
@@ -532,18 +561,18 @@ def update_motion_state(node: dict, packet: dict) -> None:
   node["source"] = zone_data.get("lighthouse") or raw.get("node_name") or raw.get("node_id") or "unknown"
   node["last_packet"] = packet
 
-  # Firmware sends no RSSI field; synthesize a proximity signal from TF-Luna deviation.
-  # Remove once hardware RF sensor is added to firmware.
-  if (rssi_value is None or rssi_value == -99.0) and has_valid_distance:
+  # Optional fallback for legacy firmware without RF telemetry.
+  # Disabled during RF isolation so TF-Luna cannot contaminate RF diagnostics.
+  if TF_LUNA_RF_FALLBACK_ENABLED and (effective_rf_rssi is None or effective_rf_rssi == -99.0) and has_valid_distance:
     dist_baseline = node.get("distance_baseline_cm")
     if dist_baseline is not None:
       dev = abs(float(distance_value) - float(dist_baseline))
       # 0 dev → -70 (quiet); 30+ cm dev → -40 (max disturbance)
-      rssi_value = -70.0 + min(dev, 30.0)
+      effective_rf_rssi = -70.0 + min(dev, 30.0)
     else:
-      rssi_value = -70.0
+      effective_rf_rssi = -70.0
 
-  update_rf_state(node, rssi_value)
+  update_rf_state(node, effective_rf_rssi)
 
 
 def apply_telemetry_packet(packet: dict) -> str | None:
@@ -725,7 +754,7 @@ HTML_PAGE = """
     .node-pill { padding:2px 6px; border-radius:999px; border:1px solid rgba(68,215,255,.24); color:var(--cyan); text-transform:uppercase; letter-spacing:.08em; font-size:.62rem; }
     .control-button { appearance:none; width:100%; border:1px solid rgba(57,255,20,.28); background:linear-gradient(180deg, rgba(18,31,22,.96), rgba(8,12,10,.98)); color:var(--text); border-radius:10px; padding:8px 9px; font-family:inherit; font-size:.73rem; letter-spacing:.06em; text-transform:uppercase; text-align:left; cursor:pointer; }
     .control-button[data-active="true"] { border-color:rgba(57,255,20,.85); background:linear-gradient(180deg, rgba(57,255,20,.18), rgba(8,12,10,.98)); box-shadow:0 0 0 1px rgba(57,255,20,.20), 0 0 22px rgba(57,255,20,.16); }
-    .guard-siren-button { appearance:none; width:100%; min-height:72px; border:1px solid rgba(255,193,7,.80); background:linear-gradient(180deg, rgba(255,213,79,.98), rgba(255,170,0,.92)); color:#231500; border-radius:14px; padding:12px 12px; font-family:inherit; font-size:.90rem; font-weight:800; letter-spacing:.08em; text-transform:uppercase; text-align:left; cursor:pointer; box-shadow:0 0 0 1px rgba(255,193,7,.28), 0 0 24px rgba(255,193,7,.18); }
+    .guard-siren-button { appearance:none; width:100%; min-height:58px; border:1px solid rgba(255,193,7,.80); background:linear-gradient(180deg, rgba(255,213,79,.98), rgba(255,170,0,.92)); color:#231500; border-radius:12px; padding:9px 10px; font-family:inherit; font-size:.82rem; font-weight:800; letter-spacing:.08em; text-transform:uppercase; text-align:left; cursor:pointer; box-shadow:0 0 0 1px rgba(255,193,7,.28), 0 0 24px rgba(255,193,7,.18); }
     .guard-siren-button[data-active="true"] { border-color:rgba(57,255,20,.82); background:linear-gradient(180deg, rgba(57,255,20,.92), rgba(23,164,71,.92)); color:#071006; box-shadow:0 0 0 1px rgba(57,255,20,.24), 0 0 30px rgba(57,255,20,.20); }
     .guard-siren-button small { display:block; margin-top:4px; font-size:.62rem; font-weight:700; letter-spacing:.05em; text-transform:none; opacity:.92; }
     .card { margin-bottom:0; }
@@ -785,6 +814,17 @@ HTML_PAGE = """
         </div>
       </div>
       <div class=\"control-panel\">
+        <div class=\"mode-switcher\">
+          <h3 class=\"mode-switcher-title\">Audio Isolation</h3>
+          <div class=\"control-readout\">
+            <strong id=\"dashboardMode\">Blue acoustic standby</strong>
+            <div class=\"mode-readout\" id=\"tfLunaAudioReadout\">TF-Luna audio OFF · RF isolation active</div>
+          </div>
+          <div class=\"mode-switcher-actions\">
+            <button class=\"mode-button\" id=\"btn-tfluna-audio\" data-active=\"false\">TF-Luna Audio: OFF</button>
+            <button class=\"mode-button\" id=\"btn-mode-interactive\" data-active=\"true\">Interactive Mode</button>
+          </div>
+        </div>
         <div class=\"control-grid\" id=\"controlPanel\"></div>
       </div>
     </div>
@@ -1419,6 +1459,8 @@ HTML_PAGE = """
     const rowsEl = document.getElementById('rows');
     const controlPanelEl = document.getElementById('controlPanel');
     const dashboardModeEl = document.getElementById('dashboardMode');
+    const tfLunaAudioReadoutEl = document.getElementById('tfLunaAudioReadout');
+    const tfLunaAudioButton = document.getElementById('btn-tfluna-audio');
     const modeInteractiveButton = document.getElementById('btn-mode-interactive');
     const modeAutomaticButton = document.getElementById('btn-mode-automatic');
     const sirenTestButton = document.getElementById('btn-siren-test');
@@ -1449,8 +1491,29 @@ HTML_PAGE = """
       }
     }
 
+    function sendTfLunaAudioEnabled(enabled) {
+      if (!isSocketOpen()) {
+        if (tfLunaAudioReadoutEl) {
+          tfLunaAudioReadoutEl.textContent = 'Dashboard socket not connected';
+        }
+        return;
+      }
+      socket.send(JSON.stringify({ type: 'tf_luna_audio', enabled }));
+      if (tfLunaAudioReadoutEl) {
+        tfLunaAudioReadoutEl.textContent = enabled
+          ? 'Requesting TF-Luna audio ON'
+          : 'Requesting TF-Luna audio OFF';
+      }
+    }
+
     if (modeInteractiveButton) {
       modeInteractiveButton.addEventListener('click', () => sendDashboardMode('FULLY_INTERACTIVE'));
+    }
+    if (tfLunaAudioButton) {
+      tfLunaAudioButton.addEventListener('click', () => {
+        const currentlyEnabled = tfLunaAudioButton.dataset.active === 'true';
+        sendTfLunaAudioEnabled(!currentlyEnabled);
+      });
     }
     if (modeAutomaticButton) {
       modeAutomaticButton.addEventListener('click', () => sendDashboardMode('FULLY_AUTOMATIC'));
@@ -1593,13 +1656,13 @@ HTML_PAGE = """
       const micEnabled = online ? Boolean(node.mic_enabled) : false;
       ui.micButton.disabled = !online;
       ui.micButton.dataset.active = String(micEnabled);
-      ui.micButton.innerHTML = `\uD83C\uDFA4 MIC: ${micEnabled ? 'UNMUTED' : 'MUTED'}<small>${online ? '' : ' \u2014 offline'}</small>`;
+      ui.micButton.innerHTML = `MIC: ${micEnabled ? 'UNMUTED' : 'MUTED'}<small>${online ? '' : ' - offline'}</small>`;
 
       // Siren button
       const sirenState = online ? Boolean(node.siren_on) : false;
       ui.sirenButton.disabled = !online;
       ui.sirenButton.dataset.active = String(sirenState);
-      ui.sirenButton.innerHTML = `\uD83D\uDD0A SIREN: ${sirenState ? 'ACTIVE' : 'OFF'}<small>${sirenState ? 'Click to silence' : (online ? 'Ready' : '\u2014 offline')}</small>`;
+      ui.sirenButton.innerHTML = `SIREN: ${sirenState ? 'ACTIVE' : 'OFF'}<small>${sirenState ? 'Click to silence' : (online ? 'Ready' : '- offline')}</small>`;
 
       // Last event
       const levEl = document.getElementById(`lev-${node.node_id}`);
@@ -1628,10 +1691,20 @@ HTML_PAGE = """
       const nodes = state.nodes || [];
       const activeNodes = nodes.filter((node) => node.motion).map((node) => node.label);
       const operationMode = String(state.operation_mode || 'FULLY_INTERACTIVE').toUpperCase();
+      const tfLunaAudioEnabled = Boolean(state.tf_luna_audio_enabled);
       const modeLabel = normalizeModeLabel(operationMode);
       statusEl.textContent = state.hub?.connected ? (activeNodes.length ? `Connected · ${modeLabel} · ${activeNodes.join(', ')} active` : `Connected · ${modeLabel} · all rooms clear`) : 'Waiting for telemetry…';
       if (dashboardModeEl) {
         dashboardModeEl.textContent = operationMode === 'FULLY_AUTOMATIC' ? 'Mode: Green actions automatic' : 'Mode: Blue acoustic standby';
+      }
+      if (tfLunaAudioReadoutEl) {
+        tfLunaAudioReadoutEl.textContent = tfLunaAudioEnabled
+          ? 'TF-Luna audio ON · chime notifications active'
+          : 'TF-Luna audio OFF · RF isolation active';
+      }
+      if (tfLunaAudioButton) {
+        tfLunaAudioButton.dataset.active = String(tfLunaAudioEnabled);
+        tfLunaAudioButton.textContent = `TF-Luna Audio: ${tfLunaAudioEnabled ? 'ON' : 'OFF'}`;
       }
       if (modeInteractiveButton) {
         modeInteractiveButton.dataset.active = String(operationMode === 'FULLY_INTERACTIVE');
@@ -1649,15 +1722,16 @@ HTML_PAGE = """
         if (enteringAlert) {
           triggerPhaseTracer(node.node_id, node.motion_label);
 
-          // TF-Luna chime — fires on TF-Luna-based state transition
-          const now = Date.now();
-          const lastPing = lastDashboardPingAt[node.node_id] || 0;
-          if (now - lastPing > 4000) {
-            lastDashboardPingAt[node.node_id] = now;
-            playDashboardQuietPing();
-            const ts = new Date().toLocaleTimeString();
-            lastEvents[node.node_id] = `TF-LUNA ${node.motion_label} \u00b7 ${ts}`;
+          if (tfLunaAudioEnabled) {
+            const now = Date.now();
+            const lastPing = lastDashboardPingAt[node.node_id] || 0;
+            if (now - lastPing > 4000) {
+              lastDashboardPingAt[node.node_id] = now;
+              playDashboardQuietPing();
+            }
           }
+          const ts = new Date().toLocaleTimeString();
+          lastEvents[node.node_id] = `TF-LUNA ${node.motion_label} \u00b7 ${ts}`;
         }
 
         // RF guard buzzer — fires once on NORMAL → CONFIRMING_TARGET RF transition
@@ -1724,7 +1798,7 @@ HTML_PAGE = """
             }
           }
         }
-        rfDiagEl.textContent = lines.join('\n');
+        rfDiagEl.textContent = lines.join('\\n');
       }
 
       updateRfHeatmap(state.rf_fusion);
@@ -1833,6 +1907,17 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
                 "message": f"Dashboard mode set to {updated_state['operation_mode']}",
               }))
               await broadcast_state(f"dashboard mode {updated_state['operation_mode']}")
+              continue
+
+            if command_type == "tf_luna_audio":
+              updated_state = set_tf_luna_audio_enabled(bool(message.get("enabled", False)))
+              await websocket.send_text(json.dumps({
+                "type": "control_ack",
+                "message": f"TF-Luna audio {'enabled' if updated_state['tf_luna_audio_enabled'] else 'muted'}",
+              }))
+              await broadcast_state(
+                f"TF-Luna audio {'enabled' if updated_state['tf_luna_audio_enabled'] else 'muted'}"
+              )
               continue
 
             if command_type != "control_command":
