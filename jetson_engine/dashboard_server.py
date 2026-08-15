@@ -209,6 +209,8 @@ def update_rf_state(node: dict, rssi_value: float | None) -> None:
   meta = ZONE_TOPOLOGY.get(node["node_id"], {})
   threshold = float(meta.get("rf_disturbance_threshold", RF_DISTURBANCE_THRESHOLD))
   scale = float(meta.get("rf_disturbance_scale", RF_DISTURBANCE_SCALE))
+  confidence_floor = float(meta.get("rf_confidence_floor", 0.0))
+  confirm_threshold = float(meta.get("rf_confirm_threshold", RF_CONFIRM_THRESHOLD))
 
   if node["rf_baseline"] is None:
     node["rf_baseline"] = rssi_value
@@ -222,11 +224,12 @@ def update_rf_state(node: dict, rssi_value: float | None) -> None:
   c_raw = max(0.0, min(1.0, (d - threshold) / max(scale, 1e-6)))
   c_prev = float(node.get("rf_confidence_smooth", 0.0))
   c_smooth = RF_ALPHA * c_raw + (1.0 - RF_ALPHA) * c_prev
+  c_smooth = max(confidence_floor, c_smooth)
 
   node["rf_confidence_raw"] = round(c_raw, 4)
   node["rf_confidence_smooth"] = round(c_smooth, 4)
   node["rf_sphere_radius"] = round(RF_R_MIN + c_smooth * (RF_R_MAX - RF_R_MIN), 2)
-  node["rf_state"] = "CONFIRMING_TARGET" if c_smooth >= RF_CONFIRM_THRESHOLD else "NORMAL"
+  node["rf_state"] = "CONFIRMING_TARGET" if c_smooth >= confirm_threshold else "NORMAL"
 
 
 def compute_rf_fusion(nodes: list) -> dict:
@@ -729,6 +732,10 @@ HTML_PAGE = """
     .scene-header h2 { font-size:.9rem; color:var(--cyan); }
     .scene-header .hint, .status-card p, .node-meta, .control-button small { color:var(--muted); }
     #canvas-container { width:100%; flex:1; min-height:220px; }
+    .scene-overlay { position:absolute; top:58px; right:12px; z-index:2; display:grid; gap:8px; pointer-events:none; }
+    .beacon-status { min-width:210px; padding:9px 11px; border-radius:12px; border:1px solid rgba(255,58,94,.35); background:rgba(38,8,20,.80); color:#ff8ba6; font-size:.72rem; letter-spacing:.10em; text-transform:uppercase; box-shadow:0 0 0 1px rgba(255,58,94,.10), 0 0 20px rgba(255,58,94,.12); }
+    .beacon-status strong { display:block; color:#ffd7e1; font-size:.78rem; letter-spacing:.12em; }
+    .beacon-status.active { border-color:rgba(255,52,52,.82); background:rgba(72,8,16,.88); color:#ffd5d5; box-shadow:0 0 0 1px rgba(255,52,52,.22), 0 0 26px rgba(255,52,52,.24); }
     .status { display:inline-flex; align-items:center; gap:.5rem; color:var(--neon); font-size:.85rem; letter-spacing:.06em; text-transform:uppercase; margin-bottom:0; }
     .status::before { content:"●"; color:var(--cyan); text-shadow:0 0 10px var(--cyan); }
     .control-panel { display:grid; align-content:start; gap:8px; min-height:0; overflow:auto; padding-right:2px; }
@@ -807,7 +814,12 @@ HTML_PAGE = """
         <div class=\"status\" id=\"status\">Connecting to edge hub…</div>
         <div class=\"scene\">
           <div class=\"scene-header\"><h2>40×40 ft Engineering Floorplan</h2><div class=\"hint\">1 unit = 1 foot · 20ft confirm radius · active zone auto-expands</div></div>
-          <div id=\"canvas-container\"></div>          <div id="nodeCardBar"></div>        </div>
+          <div id=\"canvas-container\"></div>
+          <div class=\"scene-overlay\">
+            <div class=\"beacon-status\" id=\"beaconHud\"><strong>Predator Beacon</strong>Inactive</div>
+          </div>
+          <div id="nodeCardBar"></div>
+        </div>
         <div class=\"telemetry-grid\">
           <div class=\"card\"><h3>Node Status</h3><table><thead><tr><th>Node</th><th>Motion</th><th>Signal</th><th>State</th><th>Last</th></tr></thead><tbody id=\"rows\"></tbody></table></div>
           <div class=\"card\"><h3>RF Diagnostics</h3><pre id=\"rfDiag\" style=\"font-size:.62rem;color:#d8ffe0;line-height:1.50;max-height:140px;overflow:auto\">\u2014</pre></div>
@@ -839,17 +851,48 @@ HTML_PAGE = """
     const SENSOR_HEIGHT = 5; // 5-foot tripod mount
     
     const ROOMS = {
-      "FSS-N01": { id: "FSS-N01", name: "OFFICE",      compass: "NORTH", center: [-10, 0, -10], color: 0x00ff88 },
-      "FSS-N02": { id: "FSS-N02", name: "GARAGE",      compass: "EAST",  center: [10, 0, -10],  color: 0x3399ff },
-      "FSS-N03": { id: "FSS-N03", name: "BABY'S ROOM", compass: "SOUTH", center: [-10, 0, 10],  color: 0xa0a0a0 },
-      "FSS-N04": { id: "FSS-N04", name: "ENTRYWAY",    compass: "WEST",  center: [10, 0, 10],   color: 0xffd700 }
+      "FSS-N01": {
+        id: "FSS-N01",
+        name: "OFFICE",
+        compass: "NORTH",
+        center: [-10, 0, -10],
+        accentColor: 0xc77dff,
+        anchorColor: 0x7b2cbf,
+        subzoneShades: [0x170b24, 0x201130, 0x29163c, 0x341c48],
+      },
+      "FSS-N02": {
+        id: "FSS-N02",
+        name: "GARAGE",
+        compass: "EAST",
+        center: [10, 0, -10],
+        accentColor: 0xe56bff,
+        anchorColor: 0x9d4edd,
+        subzoneShades: [0x1a0b2c, 0x221138, 0x2a1744, 0x351d52],
+      },
+      "FSS-N03": {
+        id: "FSS-N03",
+        name: "BABY'S ROOM",
+        compass: "SOUTH",
+        center: [-10, 0, 10],
+        accentColor: 0xb5179e,
+        anchorColor: 0x8a2be2,
+        subzoneShades: [0x180b25, 0x201131, 0x28173c, 0x301d47],
+      },
+      "FSS-N04": {
+        id: "FSS-N04",
+        name: "ENTRYWAY",
+        compass: "WEST",
+        center: [10, 0, 10],
+        accentColor: 0xf72585,
+        anchorColor: 0xb5179e,
+        subzoneShades: [0x1a0821, 0x220d2b, 0x2a1234, 0x33183f],
+      },
     };
 
-    // 8×8 RF probability heatmap (5 ft per cell on 40×40 ft floor)
-    const RF_GRID = 8;
-    const RF_CELL = 40 / RF_GRID;
-    const heatmapMeshes = {};  // key: "col_row"
     let rfPositionMarker = null;
+    let rfPositionRing = null;
+    const beaconTargetPosition = new THREE.Vector3(0, 2.3, 0);
+    let beaconTargetConfidence = 0;
     
     let scene, camera, renderer, orbitControls;
     let threeInitialized = false;
@@ -869,6 +912,7 @@ HTML_PAGE = """
     const lastRfState = {};        // nodeId -> previous rf_state for buzzer transition
     const rfBuzzerCooldownAt = {}; // nodeId -> ms timestamp of last RF buzzer
     const lastEvents = {};         // nodeId -> last event string for card display
+    const beaconHudEl = document.getElementById('beaconHud');
 
     function getAudioContext() {
       const AudioCtx = window.AudioContext || window.webkitAudioContext;
@@ -969,6 +1013,8 @@ HTML_PAGE = """
       const isPredator = mode === 'PREDATOR_DETECTED';
       box.userData.mode = mode;
       box.userData.alertUntil = Date.now() + 4200;
+      room.flashUntil = box.userData.alertUntil;
+      room.flashMode = mode;
 
       if (isPredator) {
         box.scale.set(1.45, 1.9, 1.45);
@@ -993,7 +1039,7 @@ HTML_PAGE = """
       if (room.phaseBox) {
         room.phaseBox.userData.mode = feature === 'siren' && enabled ? 'PREDATOR_DETECTED' : 'CONTROL_ACTIVE';
         room.phaseBox.userData.alertUntil = now + (isPingFeature ? 900 : 2200);
-        room.phaseBox.userData.controlColor = room.color;
+        room.phaseBox.userData.controlColor = room.accentColor;
         room.phaseBox.scale.set(
           feature === 'siren' && enabled ? 1.45 : 1.16,
           feature === 'siren' && enabled ? 1.9 : 1.2,
@@ -1149,35 +1195,69 @@ HTML_PAGE = """
       
       // FLOOR
       const floorGeometry = new THREE.BoxGeometry(FLOOR_WIDTH, 0.15, FLOOR_DEPTH);
-      const floorMaterial = new THREE.MeshStandardMaterial({ color: 0x0f1520, roughness: 0.85, metalness: 0.05 });
+      const floorMaterial = new THREE.MeshStandardMaterial({ color: 0x090611, roughness: 0.9, metalness: 0.06 });
       const floor = new THREE.Mesh(floorGeometry, floorMaterial);
       floor.position.set(0, -0.075, 0);
       floor.receiveShadow = true;
       scene.add(floor);
 
-      // RF probability heatmap — 8×8 grid of 5×5 ft cells lying on the floor
-      for (let col = 0; col < RF_GRID; col++) {
-        for (let row = 0; row < RF_GRID; row++) {
-          const cx = -20 + (col + 0.5) * RF_CELL;
-          const cz = -20 + (row + 0.5) * RF_CELL;
-          const geo = new THREE.PlaneGeometry(RF_CELL - 0.3, RF_CELL - 0.3);
-          const mat = new THREE.MeshBasicMaterial({ color: 0xff2200, transparent: true, opacity: 0.0, side: THREE.DoubleSide, depthWrite: false });
-          const cell = new THREE.Mesh(geo, mat);
-          cell.rotation.x = -Math.PI / 2;
-          cell.position.set(cx, 0.04, cz);
-          scene.add(cell);
-          heatmapMeshes[`${col}_${row}`] = cell;
-        }
-      }
+      // Structured room floor: each quadrant is split into 4 shaded sub-zones.
+      const subzoneSize = ROOM_WIDTH / 2;
+      const subzoneOffsets = [
+        [-subzoneSize / 2, -subzoneSize / 2],
+        [ subzoneSize / 2, -subzoneSize / 2],
+        [-subzoneSize / 2,  subzoneSize / 2],
+        [ subzoneSize / 2,  subzoneSize / 2],
+      ];
 
-      // RF position marker — glowing sphere at multilateration estimate
-      const pmGeo = new THREE.SphereGeometry(1.2, 16, 16);
-      const pmMat = new THREE.MeshBasicMaterial({ color: 0xff4444, transparent: true, opacity: 0.0, wireframe: false });
+      Object.values(ROOMS).forEach(room => {
+        room.subzones = [];
+        room.liveConfidence = 0.0;
+        room.urgency = 0.0;
+        room.flashUntil = 0;
+        room.flashMode = 'CLEAR';
+
+        subzoneOffsets.forEach(([dx, dz], index) => {
+          const geo = new THREE.PlaneGeometry(subzoneSize - 0.65, subzoneSize - 0.65);
+          const mat = new THREE.MeshBasicMaterial({
+            color: room.subzoneShades[index],
+            transparent: true,
+            opacity: 0.82,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          });
+          const mesh = new THREE.Mesh(geo, mat);
+          mesh.rotation.x = -Math.PI / 2;
+          mesh.position.set(room.center[0] + dx, 0.04, room.center[2] + dz);
+          mesh.userData.baseColor = new THREE.Color(room.subzoneShades[index]);
+          mesh.userData.liveOffset = index * 0.7;
+          scene.add(mesh);
+          room.subzones.push(mesh);
+        });
+
+        const roomOutline = new THREE.LineSegments(
+          new THREE.EdgesGeometry(new THREE.PlaneGeometry(ROOM_WIDTH - 0.2, ROOM_DEPTH - 0.2)),
+          new THREE.LineBasicMaterial({ color: room.accentColor, transparent: true, opacity: 0.22 })
+        );
+        roomOutline.rotation.x = -Math.PI / 2;
+        roomOutline.position.set(room.center[0], 0.05, room.center[2]);
+        scene.add(roomOutline);
+        room.outline = roomOutline;
+      });
+
+      // Predator beacon — a single fused intruder estimate.
+      const pmGeo = new THREE.OctahedronGeometry(1.5, 0);
+      const pmMat = new THREE.MeshBasicMaterial({ color: 0xff3344, transparent: true, opacity: 0.0, wireframe: false });
       rfPositionMarker = new THREE.Mesh(pmGeo, pmMat);
-      rfPositionMarker.position.set(0, 1.2, 0);
-      const pmRing = new THREE.Mesh(new THREE.RingGeometry(1.8, 2.2, 32), new THREE.MeshBasicMaterial({ color: 0xff4444, transparent: true, opacity: 0.0, side: THREE.DoubleSide }));
-      pmRing.rotation.x = -Math.PI / 2;
-      rfPositionMarker.add(pmRing);
+      rfPositionMarker.position.set(0, 2.3, 0);
+      rfPositionMarker.visible = false;
+      rfPositionRing = new THREE.Mesh(
+        new THREE.RingGeometry(1.8, 2.35, 32),
+        new THREE.MeshBasicMaterial({ color: 0xff3344, transparent: true, opacity: 0.0, side: THREE.DoubleSide })
+      );
+      rfPositionRing.rotation.x = -Math.PI / 2;
+      rfPositionRing.position.y = -1.75;
+      rfPositionMarker.add(rfPositionRing);
       scene.add(rfPositionMarker);
       
       // ENGINEERING GRID (1-foot spacing)
@@ -1221,7 +1301,7 @@ HTML_PAGE = """
         
         // Monitoring sphere (pulsing)
         const sphereGeo = new THREE.SphereGeometry(6, 32, 32);
-        const sphereMat = new THREE.MeshBasicMaterial({ color: room.color, transparent: true, opacity: 0.12, wireframe: true });
+        const sphereMat = new THREE.MeshBasicMaterial({ color: room.accentColor, transparent: true, opacity: 0.12, wireframe: true });
         const sphere = new THREE.Mesh(sphereGeo, sphereMat);
         sphere.userData.baseScale = 1;
         nodeGroup.add(sphere);
@@ -1229,7 +1309,7 @@ HTML_PAGE = """
         nodeSpheres[room.id] = sphere;
         
         // Point light
-        const pointLight = new THREE.PointLight(room.color, 1.5, 18);
+        const pointLight = new THREE.PointLight(room.accentColor, 1.4, 20);
         nodeGroup.add(pointLight);
         
         scene.add(nodeGroup);
@@ -1247,17 +1327,6 @@ HTML_PAGE = """
         nodeGroup.add(phaseBox);
         room.phaseBox = phaseBox;
 
-        // RF confidence wireframe box — direction UNKNOWN; expands with RF disturbance confidence
-        const rfBoxGeo = new THREE.BoxGeometry(3, 3, 3);
-        const rfBoxMat = new THREE.MeshBasicMaterial({ color: 0xffd700, wireframe: true, transparent: true, opacity: 0.0 });
-        const rfBox = new THREE.Mesh(rfBoxGeo, rfBoxMat);
-        rfBox.position.set(0, 1.5, 0);
-        rfBox.userData.rfState = 'NORMAL';
-        rfBox.userData.rfConfidence = 0.0;
-        rfBox.userData.rfRadius = 2.0;
-        rfBox.userData.direction = 'UNKNOWN';
-        nodeGroup.add(rfBox);
-        room.rfBox = rfBox;
       });
       
       // DIMENSION LABEL
@@ -1321,26 +1390,46 @@ HTML_PAGE = """
         }
       });
 
-      // RF confidence box animation — yellow wireframe, direction always UNKNOWN for now
       Object.values(ROOMS).forEach((room) => {
-        const rfBox = room.rfBox;
-        if (!rfBox) return;
-        const rfState = rfBox.userData.rfState || 'NORMAL';
-        const rfConf = rfBox.userData.rfConfidence || 0.0;
-        const rfRadius = rfBox.userData.rfRadius || 2.0;
-        if (rfState === 'CONFIRMING_TARGET') {
-          rfBox.material.color.setHex(0xffe44a);
-          rfBox.material.opacity = 0.38 + Math.abs(Math.sin(animTime * 3.0)) * 0.40;
-        } else if (rfConf > 0.05) {
-          rfBox.material.color.setHex(0xffd700);
-          rfBox.material.opacity = 0.05 + rfConf * 0.22;
-        } else {
-          rfBox.material.opacity = Math.max(0.0, rfBox.material.opacity - 0.04);
+        const conf = room.liveConfidence || 0.0;
+        const urgency = room.urgency || 0.0;
+        const pulse = 0.62 + Math.abs(Math.sin(animTime * (0.8 + urgency * 4.8))) * 0.38;
+        const flashActive = room.flashUntil && nowMs < room.flashUntil;
+
+        if (Array.isArray(room.subzones)) {
+          room.subzones.forEach((mesh) => {
+            const baseColor = mesh.userData.baseColor.clone();
+            const color = baseColor.lerp(new THREE.Color(room.accentColor), Math.min(0.82, conf * (0.55 + pulse * 0.35)));
+            if (flashActive) {
+              const flashColor = room.flashMode === 'PREDATOR_DETECTED' ? new THREE.Color(0xff3344) : new THREE.Color(0xff88aa);
+              const flashMix = 0.22 + Math.abs(Math.sin(animTime * 6 + mesh.userData.liveOffset)) * 0.28;
+              color.lerp(flashColor, flashMix);
+            }
+            mesh.material.color.copy(color);
+            mesh.material.opacity = Math.min(0.96, 0.58 + conf * 0.22 + pulse * conf * 0.14 + (flashActive ? 0.05 : 0.0));
+          });
         }
-        const boxScale = Math.max(0.33, rfRadius / 6.0);
-        rfBox.scale.set(boxScale, boxScale, boxScale);
-        rfBox.rotation.y += 0.007;
+
+        if (room.outline) {
+          room.outline.material.opacity = Math.min(0.9, 0.18 + conf * 0.38 + (flashActive ? 0.14 : 0.0));
+        }
       });
+
+      if (rfPositionMarker) {
+        const active = beaconTargetConfidence >= 0.30;
+        const floatY = 2.2 + Math.sin(animTime * 3.6) * (active ? 0.35 : 0.08);
+        const targetPos = new THREE.Vector3(beaconTargetPosition.x, floatY, beaconTargetPosition.z);
+        rfPositionMarker.position.lerp(targetPos, active ? 0.12 : 0.08);
+        rfPositionMarker.rotation.y += active ? 0.08 : 0.02;
+        rfPositionMarker.rotation.x += active ? 0.03 : 0.008;
+        const targetOpacity = active ? Math.min(0.95, 0.35 + beaconTargetConfidence * 0.6) : 0.0;
+        rfPositionMarker.material.opacity += (targetOpacity - rfPositionMarker.material.opacity) * 0.16;
+        rfPositionMarker.visible = active || rfPositionMarker.material.opacity > 0.02;
+        if (rfPositionRing) {
+          rfPositionRing.material.opacity = rfPositionMarker.material.opacity * 0.55;
+          rfPositionRing.scale.setScalar(1 + Math.abs(Math.sin(animTime * 4.5)) * 0.14);
+        }
+      }
 
       orbitControls.update();
       renderer.render(scene, camera);
@@ -1383,10 +1472,12 @@ HTML_PAGE = """
       const rfConf = node.rf_confidence_smooth || 0.0;
       const controlActive = sphere.userData.controlUntil && Date.now() < sphere.userData.controlUntil;
       const sirenActive = Boolean(node.siren_on);
+      room.liveConfidence = rfConf;
+      room.urgency = sirenActive ? 1.0 : isPredator ? 0.95 : rfState === 'CONFIRMING_TARGET' ? Math.max(0.72, rfConf) : rfConf;
 
       // RF confidence drives sphere scale (base geometry radius = 6 ft)
       sphere.userData.dynamicScale = Math.max(0.33, rfRadius / 6.0);
-      sphere.material.color.setHex(room.color);
+      sphere.material.color.setHex(room.accentColor);
 
       if (controlActive && sirenActive) {
         sphere.material.opacity = 0.48;
@@ -1406,50 +1497,26 @@ HTML_PAGE = """
       if (pointLight) {
         pointLight.intensity = sirenActive ? 3.2 : isPredator ? 2.9 : rfState === 'CONFIRMING_TARGET' ? 2.0 : hasFreshData ? 0.9 : 0.35;
       }
-
-      // Push RF data into the rfBox for the animate loop
-      if (room.rfBox) {
-        room.rfBox.userData.rfState = rfState;
-        room.rfBox.userData.rfConfidence = rfConf;
-        room.rfBox.userData.rfRadius = rfRadius;
-        room.rfBox.userData.direction = node.direction || 'UNKNOWN';
-      }
     }
 
-    // Update 8×8 probability heatmap and multilateration position marker
+    // Update fused predator beacon using multilateration estimate.
     function updateRfHeatmap(rfFusion) {
       if (!rfFusion) return;
-
-      // Fade all cells
-      for (const mesh of Object.values(heatmapMeshes)) {
-        mesh.material.opacity = Math.max(0, mesh.material.opacity - 0.06);
-      }
-
-      const field = rfFusion.probability_field;
-      if (Array.isArray(field) && field.length > 0) {
-        for (const [col, row, prob] of field) {
-          const mesh = heatmapMeshes[`${col}_${row}`];
-          if (!mesh) continue;
-          // Heat colour: dark red → orange → yellow (low → high probability)
-          const r = 1.0;
-          const g = prob > 0.5 ? (prob - 0.5) * 2.0 : 0.0;
-          mesh.material.color.setRGB(r, g, 0.0);
-          mesh.material.opacity = Math.max(mesh.material.opacity, prob * 0.60);
-        }
-      }
-
-      // Position marker from multilateration
       const pe = rfFusion.position_estimate;
-      if (rfPositionMarker && pe && pe.state === 'ACTIVE' && pe.position_3d) {
+      if (pe && pe.state === 'ACTIVE' && pe.position_3d && (pe.confidence ?? 0) >= 0.30) {
         const [px, py, pz] = pe.position_3d;
-        rfPositionMarker.position.set(px, 1.2, pz);
-        rfPositionMarker.material.opacity = Math.min(0.92, pe.confidence * 1.4);
-        const ring = rfPositionMarker.children[0];
-        if (ring) ring.material.opacity = rfPositionMarker.material.opacity * 0.55;
-        rfPositionMarker.material.color.setHex(pe.confidence > 0.5 ? 0xff2222 : 0xff8844);
-      } else if (rfPositionMarker) {
-        rfPositionMarker.material.opacity = Math.max(0, rfPositionMarker.material.opacity - 0.04);
-        if (rfPositionMarker.children[0]) rfPositionMarker.children[0].material.opacity = Math.max(0, rfPositionMarker.children[0].material.opacity - 0.04);
+        beaconTargetPosition.set(px, 2.3, pz);
+        beaconTargetConfidence = pe.confidence ?? 0;
+        if (beaconHudEl) {
+          beaconHudEl.classList.add('active');
+          beaconHudEl.innerHTML = `<strong>Predator Beacon</strong>Target locked · conf ${(beaconTargetConfidence * 100).toFixed(0)}%`;
+        }
+      } else {
+        beaconTargetConfidence = 0;
+        if (beaconHudEl) {
+          beaconHudEl.classList.remove('active');
+          beaconHudEl.innerHTML = '<strong>Predator Beacon</strong>Inactive';
+        }
       }
     }
 
