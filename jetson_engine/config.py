@@ -11,8 +11,6 @@ ZONE_TOPOLOGY = {
         "motion_predator_delta_cm": 45,
         "motion_baseline_update_delta_cm": 12,
         "motion_rssi_margin": 5.0,
-        "rf_confirm_enter_threshold": 0.90,
-        "rf_confirm_exit_threshold": 0.50,
         "mount_height_ft": 5,
         "vertical_reference": {
             "above": "ZONE_UPSTAIRS",
@@ -29,9 +27,6 @@ ZONE_TOPOLOGY = {
         "motion_predator_delta_cm": 52,
         "motion_baseline_update_delta_cm": 12,
         "motion_rssi_margin": 5.0,
-        "rf_disturbance_threshold": 20.0,
-        "rf_confirm_enter_threshold": 0.99,
-        "rf_confirm_exit_threshold": 0.50,
         "mount_height_ft": 5,
         "vertical_reference": {
             "above": "NONE",
@@ -48,8 +43,6 @@ ZONE_TOPOLOGY = {
         "motion_predator_delta_cm": 30,
         "motion_baseline_update_delta_cm": 10,
         "motion_rssi_margin": 4.0,
-        "rf_confirm_enter_threshold": 0.90,
-        "rf_confirm_exit_threshold": 0.50,
         "mount_height_ft": 5,
         "vertical_reference": {
             "above": "NONE",
@@ -66,8 +59,6 @@ ZONE_TOPOLOGY = {
         "motion_predator_delta_cm": 70,
         "motion_baseline_update_delta_cm": 15,
         "motion_rssi_margin": 7.0,
-        "rf_confirm_enter_threshold": 0.90,
-        "rf_confirm_exit_threshold": 0.50,
         "mount_height_ft": 5,
         "vertical_reference": {
             "above": "NONE",
