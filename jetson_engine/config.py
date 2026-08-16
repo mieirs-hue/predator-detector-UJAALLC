@@ -8,7 +8,9 @@ ZONE_TOPOLOGY = {
         "color": "#00FF88",  # Green - Primary Active
         "baseline_rssi": -65,
         "rf_confidence_floor": 0.20,
-        "rf_confirm_threshold": 0.60,
+        "rf_confirm_threshold": 0.999,
+        "rf_reset_threshold": 0.50,
+        "rf_sphere_activation_threshold": 0.50,
         "motion_confirm_delta_cm": 20,
         "motion_predator_delta_cm": 45,
         "motion_baseline_update_delta_cm": 12,
@@ -43,7 +45,9 @@ ZONE_TOPOLOGY = {
         "label": "Baby's Room",
         "color": "#A0A0A0",  # Gray - Baseline/Control
         "baseline_rssi": -85,
-        "rf_confirm_threshold": 0.80,
+        "rf_confirm_threshold": 0.999,
+        "rf_reset_threshold": 0.50,
+        "rf_sphere_activation_threshold": 0.50,
         "motion_confirm_delta_cm": 14,
         "motion_predator_delta_cm": 30,
         "motion_baseline_update_delta_cm": 10,
@@ -60,7 +64,9 @@ ZONE_TOPOLOGY = {
         "label": "Entryway",
         "color": "#FFD700",  # Gold - Entry Monitor
         "baseline_rssi": -60,
-        "rf_confirm_threshold": 0.80,
+        "rf_confirm_threshold": 0.999,
+        "rf_reset_threshold": 0.50,
+        "rf_sphere_activation_threshold": 0.50,
         "motion_confirm_delta_cm": 30,
         "motion_predator_delta_cm": 70,
         "motion_baseline_update_delta_cm": 15,

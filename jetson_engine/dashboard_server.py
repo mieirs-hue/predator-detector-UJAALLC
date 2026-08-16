@@ -211,6 +211,8 @@ def update_rf_state(node: dict, rssi_value: float | None) -> None:
   scale = float(meta.get("rf_disturbance_scale", RF_DISTURBANCE_SCALE))
   confidence_floor = float(meta.get("rf_confidence_floor", 0.0))
   confirm_threshold = float(meta.get("rf_confirm_threshold", RF_CONFIRM_THRESHOLD))
+  reset_threshold = float(meta.get("rf_reset_threshold", confirm_threshold))
+  sphere_activation_threshold = float(meta.get("rf_sphere_activation_threshold", 0.0))
 
   if node["rf_baseline"] is None:
     node["rf_baseline"] = rssi_value
@@ -226,10 +228,23 @@ def update_rf_state(node: dict, rssi_value: float | None) -> None:
   c_smooth = RF_ALPHA * c_raw + (1.0 - RF_ALPHA) * c_prev
   c_smooth = max(confidence_floor, c_smooth)
 
+  # Optional sphere gating: keep minimum radius until confidence crosses activation threshold.
+  if sphere_activation_threshold > 0.0:
+    gated = (c_smooth - sphere_activation_threshold) / max(1.0 - sphere_activation_threshold, 1e-6)
+    c_for_radius = max(0.0, min(1.0, gated))
+  else:
+    c_for_radius = c_smooth
+
+  # Hysteresis for RF state transitions: enter at confirm_threshold, exit at reset_threshold.
+  if node["rf_state"] == "CONFIRMING_TARGET":
+    next_rf_state = "CONFIRMING_TARGET" if c_smooth >= reset_threshold else "NORMAL"
+  else:
+    next_rf_state = "CONFIRMING_TARGET" if c_smooth >= confirm_threshold else "NORMAL"
+
   node["rf_confidence_raw"] = round(c_raw, 4)
   node["rf_confidence_smooth"] = round(c_smooth, 4)
-  node["rf_sphere_radius"] = round(RF_R_MIN + c_smooth * (RF_R_MAX - RF_R_MIN), 2)
-  node["rf_state"] = "CONFIRMING_TARGET" if c_smooth >= confirm_threshold else "NORMAL"
+  node["rf_sphere_radius"] = round(RF_R_MIN + c_for_radius * (RF_R_MAX - RF_R_MIN), 2)
+  node["rf_state"] = next_rf_state
 
 
 def compute_rf_fusion(nodes: list) -> dict:
