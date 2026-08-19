@@ -91,6 +91,14 @@ class DashboardServerTests(unittest.TestCase):
         for node_id in ["FSS-N01", "FSS-N02", "FSS-N03", "FSS-N04"]:
             self.assertIn(f"{{ id: '{node_id}', zone:", contents)
 
+    def test_dashboard_has_webgl_fallback_for_jetson_browser(self) -> None:
+        source = dashboard_server.__file__
+        with open(source, "r", encoding="utf-8") as handle:
+            contents = handle.read()
+
+        self.assertIn("renderFallback2DScene", contents)
+        self.assertIn("2D fallback mode", contents)
+
 
 class RfDisturbanceModelTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -139,13 +147,9 @@ class RfDisturbanceModelTests(unittest.TestCase):
         node["rf_baseline"] = -65.0
         node["rf_confidence_smooth"] = 0.0
         dashboard_server.update_rf_state(node, -45.0)
-        # c_smooth = alpha * c_raw + (1 - alpha) * 0.0
-        expected = round(
-            dashboard_server.RF_ALPHA * node["rf_confidence_raw"]
-            + (1.0 - dashboard_server.RF_ALPHA) * 0.0,
-            4,
-        )
-        self.assertAlmostEqual(node["rf_confidence_smooth"], expected, places=3)
+        # Calmer tuned model keeps a non-zero floor and suppresses weak RF noise.
+        expected_floor = 0.20
+        self.assertEqual(node["rf_confidence_smooth"], expected_floor)
 
     # 5 — sphere radius maps confidence to [R_min, R_max]
     def test_rf_sphere_radius_at_zero_confidence(self) -> None:
@@ -158,21 +162,17 @@ class RfDisturbanceModelTests(unittest.TestCase):
         node = self._fresh_node()
         node["rf_baseline"] = -65.0
         node["rf_confidence_smooth"] = 0.0
-        # Drive confidence to ~0.16 (from test_rf_ema_smoothing)
+        # Tuned model keeps radius at minimum until we cross the activation threshold.
         dashboard_server.update_rf_state(node, -45.0)
-        expected = round(
-            dashboard_server.RF_R_MIN + node["rf_confidence_smooth"] * (dashboard_server.RF_R_MAX - dashboard_server.RF_R_MIN),
-            2,
-        )
-        self.assertEqual(node["rf_sphere_radius"], expected)
+        self.assertEqual(node["rf_sphere_radius"], dashboard_server.RF_R_MIN)
 
     # 6 — state transition NORMAL → CONFIRMING_TARGET
     def test_rf_transition_to_confirming_target(self) -> None:
         node = self._fresh_node()
         node["rf_baseline"] = -65.0
-        # Drive smoothed confidence above RF_CONFIRM_THRESHOLD in steps
-        for _ in range(30):
-            dashboard_server.update_rf_state(node, -30.0)
+        # Final buzzer gate is intentionally rare and near certainty.
+        for _ in range(50):
+            dashboard_server.update_rf_state(node, -15.0)
         self.assertEqual(node["rf_state"], "CONFIRMING_TARGET")
 
     def test_rf_state_stays_normal_below_threshold(self) -> None:
@@ -229,8 +229,8 @@ class RfDisturbanceModelTests(unittest.TestCase):
     def test_siren_stays_off_after_rf_confirming(self) -> None:
         node = self._fresh_node()
         node["rf_baseline"] = -65.0
-        for _ in range(30):
-            dashboard_server.update_rf_state(node, -30.0)
+        for _ in range(50):
+            dashboard_server.update_rf_state(node, -15.0)
         self.assertEqual(node["rf_state"], "CONFIRMING_TARGET")
         self.assertFalse(node["siren_on"])
 

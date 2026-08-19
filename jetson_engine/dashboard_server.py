@@ -37,7 +37,7 @@ RF_R_MIN: float = 2.0               # minimum confidence sphere radius (ft)
 RF_R_MAX: float = 20.0              # maximum confidence sphere radius (ft)
 RF_DISTURBANCE_THRESHOLD: float = 8.0    # dB from baseline before confidence rises
 RF_DISTURBANCE_SCALE: float = 15.0       # dB range mapping 0→1 confidence
-RF_CONFIRM_THRESHOLD: float = 0.50       # smoothed confidence level for CONFIRMING_TARGET
+RF_CONFIRM_THRESHOLD: float = 0.999      # rare, high-confidence RF buzzer gate to avoid over-alerting
 RF_BUZZER_COOLDOWN_S: float = 3.0        # minimum seconds between per-node RF buzzer events
 RF_MIN_FUSION_WEIGHT: float = 0.30       # minimum sum(C_i) to compute fusion centroid
 
@@ -120,7 +120,7 @@ def build_initial_state() -> dict:
     "type": "dashboard_state",
     "updated_at": None,
     "operation_mode": "FULLY_INTERACTIVE",
-    "tf_luna_audio_enabled": False,
+    "tf_luna_audio_enabled": True,
     "hub": {
       "connected": False,
       "last_seen": None,
@@ -170,7 +170,7 @@ def snapshot_state(message: str | None = None) -> dict:
     "type": "dashboard_state",
     "updated_at": datetime.now().isoformat(),
     "operation_mode": dashboard_state.get("operation_mode", "FULLY_INTERACTIVE"),
-    "tf_luna_audio_enabled": bool(dashboard_state.get("tf_luna_audio_enabled", False)),
+    "tf_luna_audio_enabled": bool(dashboard_state.get("tf_luna_audio_enabled", True)),
     "hub": dict(dashboard_state["hub"]),
     "latest_packet": dashboard_state["latest_packet"],
     "nodes": [dict(node) for node in dashboard_state["nodes"]],
@@ -906,8 +906,15 @@ HTML_PAGE = """
 
     let rfPositionMarker = null;
     let rfPositionRing = null;
-    const beaconTargetPosition = new THREE.Vector3(0, 2.3, 0);
+    let beaconTargetPosition = null;
     let beaconTargetConfidence = 0;
+
+    function ensureBeaconTargetPosition() {
+      if (!beaconTargetPosition && window.THREE) {
+        beaconTargetPosition = new THREE.Vector3(0, 2.3, 0);
+      }
+      return beaconTargetPosition;
+    }
     
     let scene, camera, renderer, orbitControls;
     let threeInitialized = false;
@@ -1158,21 +1165,156 @@ HTML_PAGE = """
         status.textContent = '3D unavailable - check Chromium GPU/WebGL flags';
       }
     }
+
+    function renderFallback2DScene(message = '2D fallback mode') {
+      const container = document.getElementById('canvas-container');
+      if (!container) return;
+      container.innerHTML = '';
+
+      const canvas = document.createElement('canvas');
+      canvas.width = Math.max(600, container.clientWidth || 900);
+      canvas.height = Math.max(320, container.clientHeight || 420);
+      canvas.style.width = '100%';
+      canvas.style.height = '100%';
+      canvas.style.display = 'block';
+      canvas.style.background = 'radial-gradient(circle at top, rgba(90, 158, 255, 0.08), transparent 30%), linear-gradient(180deg, rgba(7,12,17,0.94), rgba(4,8,11,0.94))';
+      container.appendChild(canvas);
+
+      const ctx = canvas.getContext('2d');
+      const rooms = [
+        { id: 'FSS-N01', label: 'OFFICE', x: 12, y: 18, color: '#b28df7', active: 0.44 },
+        { id: 'FSS-N02', label: 'GARAGE', x: canvas.width / 2 + 6, y: 18, color: '#67a9ff', active: 0.31 },
+        { id: 'FSS-N03', label: "BABY'S ROOM", x: 12, y: canvas.height / 2 + 6, color: '#8c82ff', active: 0.22 },
+        { id: 'FSS-N04', label: 'ENTRYWAY', x: canvas.width / 2 + 6, y: canvas.height / 2 + 6, color: '#d5d884', active: 0.18 },
+      ];
+
+      const roomWidth = Math.max(180, (canvas.width - 52) / 2);
+      const roomHeight = Math.max(120, (canvas.height - 62) / 2);
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = 'rgba(5, 11, 15, 0.9)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      rooms.forEach((room) => {
+        const px = room.x;
+        const py = room.y;
+        const w = roomWidth - 12;
+        const h = roomHeight - 12;
+
+        ctx.fillStyle = room.color + '25';
+        ctx.fillRect(px, py, w, h);
+        ctx.strokeStyle = room.color + 'aa';
+        ctx.lineWidth = 1.8;
+        ctx.strokeRect(px, py, w, h);
+
+        for (let row = 0; row < 2; row++) {
+          for (let col = 0; col < 2; col++) {
+            const sx = px + 10 + col * (w / 2 - 6);
+            const sy = py + 32 + row * (h / 2 - 6);
+            const sw = (w / 2) - 12;
+            const sh = (h / 2) - 12;
+            const intensity = 0.18 + room.active * 0.75 + (row + col) * 0.08;
+            ctx.fillStyle = room.color + String(Math.floor(80 + intensity * 120)).toString(16).padStart(2, '0');
+            ctx.fillRect(sx, sy, sw, sh);
+          }
+        }
+
+        ctx.fillStyle = '#edf7ff';
+        ctx.font = 'bold 12px Consolas';
+        ctx.fillText(room.label, px + 12, py + 18);
+      });
+
+      const beaconX = canvas.width * 0.5;
+      const beaconY = canvas.height * 0.5;
+      const pulse = 0.32 + Math.sin(Date.now() / 250) * 0.08;
+      const ringRadius = 18 + pulse * 12;
+
+      ctx.beginPath();
+      ctx.arc(beaconX, beaconY, ringRadius, 0, Math.PI * 2);
+      ctx.strokeStyle = `rgba(255, 70, 70, ${0.34 + pulse})`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(beaconX, beaconY, 8 + pulse * 8, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255, 60, 60, 0.96)';
+      ctx.fill();
+
+      const status = document.getElementById('status');
+      if (status) {
+        status.textContent = message === '2D fallback mode' ? '2D fallback mode · WebGL unavailable' : message;
+      }
+
+      const beaconHud = document.getElementById('beaconHud');
+      if (beaconHud) {
+        beaconHud.classList.add('active');
+        beaconHud.innerHTML = '<strong>Predator Beacon</strong>2D fallback · target estimate';
+      }
+
+      const frame = () => {
+        const now = Date.now();
+        const glow = 0.42 + Math.sin(now / 260) * 0.18;
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.fillStyle = 'rgba(5, 11, 15, 0.9)';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+        rooms.forEach((room) => {
+          const px = room.x;
+          const py = room.y;
+          const w = roomWidth - 12;
+          const h = roomHeight - 12;
+          ctx.fillStyle = room.color + '25';
+          ctx.fillRect(px, py, w, h);
+          ctx.strokeStyle = room.color + 'aa';
+          ctx.strokeRect(px, py, w, h);
+
+          for (let row = 0; row < 2; row++) {
+            for (let col = 0; col < 2; col++) {
+              const sx = px + 10 + col * (w / 2 - 6);
+              const sy = py + 32 + row * (h / 2 - 6);
+              const sw = (w / 2) - 12;
+              const sh = (h / 2) - 12;
+              const intensity = 0.18 + room.active * 0.75 + (row + col) * 0.08 + glow * 0.12;
+              ctx.fillStyle = room.color + String(Math.floor(80 + intensity * 120)).toString(16).padStart(2, '0');
+              ctx.fillRect(sx, sy, sw, sh);
+            }
+          }
+          ctx.fillStyle = '#edf7ff';
+          ctx.font = 'bold 12px Consolas';
+          ctx.fillText(room.label, px + 12, py + 18);
+        });
+
+        const pulseRadius = 18 + (Math.sin(now / 220) * 6 + 6) * (0.9 + glow);
+        ctx.beginPath();
+        ctx.arc(beaconX, beaconY, pulseRadius, 0, Math.PI * 2);
+        ctx.strokeStyle = `rgba(255, 70, 70, ${0.28 + glow})`;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(beaconX, beaconY, 8 + glow * 7, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255, 60, 60, 0.96)';
+        ctx.fill();
+        requestAnimationFrame(frame);
+      };
+
+      requestAnimationFrame(frame);
+    }
     
     function initThreeJS() {
       const container = document.getElementById('canvas-container');
+      if (!container) return;
       const width = container.clientWidth;
       const height = container.clientHeight;
 
       if (!window.THREE) {
-        renderSceneError('Three.js did not load. Verify network access to CDN or bundle vendor scripts locally.');
+        renderFallback2DScene('3D fallback: Three.js did not load. Using 2D room view.');
         return;
       }
 
       const webglProbe = document.createElement('canvas');
       const webglOk = !!(webglProbe.getContext('webgl') || webglProbe.getContext('experimental-webgl'));
       if (!webglOk) {
-        renderSceneError('WebGL is disabled in Chromium. On Jetson try: chromium --ignore-gpu-blocklist --enable-gpu-rasterization --use-gl=egl');
+        renderFallback2DScene('2D fallback mode');
         return;
       }
       
@@ -1432,9 +1574,16 @@ HTML_PAGE = """
 
       if (rfPositionMarker) {
         const active = beaconTargetConfidence >= 0.30;
-        const floatY = 2.2 + Math.sin(animTime * 3.6) * (active ? 0.35 : 0.08);
-        const targetPos = new THREE.Vector3(beaconTargetPosition.x, floatY, beaconTargetPosition.z);
-        rfPositionMarker.position.lerp(targetPos, active ? 0.12 : 0.08);
+        const targetPosition = ensureBeaconTargetPosition();
+        if (targetPosition) {
+          const floatY = 2.2 + Math.sin(animTime * 3.6) * (active ? 0.35 : 0.08);
+          const targetPos = new THREE.Vector3(targetPosition.x, floatY, targetPosition.z);
+          rfPositionMarker.position.lerp(targetPos, active ? 0.12 : 0.08);
+          if (rfPositionRing) {
+            rfPositionRing.material.opacity = rfPositionMarker.material.opacity * 0.55;
+            rfPositionRing.scale.setScalar(1 + Math.abs(Math.sin(animTime * 4.5)) * 0.14);
+          }
+        }
         rfPositionMarker.rotation.y += active ? 0.08 : 0.02;
         rfPositionMarker.rotation.x += active ? 0.03 : 0.008;
         const targetOpacity = active ? Math.min(0.95, 0.35 + beaconTargetConfidence * 0.6) : 0.0;
