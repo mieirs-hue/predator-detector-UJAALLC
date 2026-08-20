@@ -8,8 +8,8 @@ ZONE_TOPOLOGY = {
         "color": "#00FF88",  # Green - Primary Active
         "baseline_rssi": -65,
         "rf_confidence_floor": 0.20,
-        "rf_confirm_threshold": 0.999,
-        "rf_reset_threshold": 0.95,
+        "rf_confirm_threshold": 0.800,
+        "rf_reset_threshold": 0.75,
         "rf_sphere_activation_threshold": 0.35,
         "motion_confirm_delta_cm": 20,
         "motion_predator_delta_cm": 45,
@@ -28,8 +28,8 @@ ZONE_TOPOLOGY = {
         "color": "#3399FF",  # Blue - Equipment
         "baseline_rssi": -70,
         "rf_confidence_floor": 0.20,
-        "rf_confirm_threshold": 0.999,
-        "rf_reset_threshold": 0.95,
+        "rf_confirm_threshold": 0.800,
+        "rf_reset_threshold": 0.75,
         "rf_sphere_activation_threshold": 0.35,
         "motion_confirm_delta_cm": 24,
         "motion_predator_delta_cm": 52,
@@ -48,8 +48,8 @@ ZONE_TOPOLOGY = {
         "color": "#A0A0A0",  # Gray - Baseline/Control
         "baseline_rssi": -85,
         "rf_confidence_floor": 0.20,
-        "rf_confirm_threshold": 0.999,
-        "rf_reset_threshold": 0.95,
+        "rf_confirm_threshold": 0.800,
+        "rf_reset_threshold": 0.75,
         "rf_sphere_activation_threshold": 0.35,
         "motion_confirm_delta_cm": 14,
         "motion_predator_delta_cm": 30,
@@ -68,8 +68,8 @@ ZONE_TOPOLOGY = {
         "color": "#FFD700",  # Gold - Entry Monitor
         "baseline_rssi": -60,
         "rf_confidence_floor": 0.20,
-        "rf_confirm_threshold": 0.999,
-        "rf_reset_threshold": 0.95,
+        "rf_confirm_threshold": 0.800,
+        "rf_reset_threshold": 0.75,
         "rf_sphere_activation_threshold": 0.35,
         "motion_confirm_delta_cm": 30,
         "motion_predator_delta_cm": 70,

@@ -37,7 +37,7 @@ RF_R_MIN: float = 2.0               # minimum confidence sphere radius (ft)
 RF_R_MAX: float = 20.0              # maximum confidence sphere radius (ft)
 RF_DISTURBANCE_THRESHOLD: float = 8.0    # dB from baseline before confidence rises
 RF_DISTURBANCE_SCALE: float = 15.0       # dB range mapping 0→1 confidence
-RF_CONFIRM_THRESHOLD: float = 0.999      # rare, high-confidence RF buzzer gate to avoid over-alerting
+RF_CONFIRM_THRESHOLD: float = 0.800      # high-confidence RF buzzer gate to avoid over-alerting
 RF_BUZZER_COOLDOWN_S: float = 3.0        # minimum seconds between per-node RF buzzer events
 RF_MIN_FUSION_WEIGHT: float = 0.30       # minimum sum(C_i) to compute fusion centroid
 
