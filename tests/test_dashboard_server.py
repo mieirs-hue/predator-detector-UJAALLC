@@ -78,6 +78,27 @@ class DashboardServerTests(unittest.TestCase):
         self.assertTrue(updated["mic_enabled"])
         self.assertEqual(updated["mic_state"], "UNMUTED")
 
+    def test_microphone_alarm_activates_at_minus_30_dbfs(self) -> None:
+        node = self.make_node("FSS-N03")
+        packet = {
+            "zone_data": {
+                "lighthouse": "FSS-N03",
+                "state": {"state": "CLEAR"},
+                "raw_telemetry": {
+                    "distance_cm": 200,
+                    "status": "OK",
+                    "audio_ready": True,
+                    "mic_enabled": True,
+                    "mic_rms": 10 ** (-30.0 / 20.0),
+                },
+            }
+        }
+
+        dashboard_server.update_motion_state(node, packet)
+
+        self.assertTrue(node["mic_alarm_active"])
+        self.assertEqual(node["motion_label"], "CLEAR")
+
         updated = dashboard_server.toggle_node_feature(node["node_id"], "mic", False)
         self.assertFalse(updated["mic_enabled"])
         self.assertEqual(updated["mic_state"], "MUTED")

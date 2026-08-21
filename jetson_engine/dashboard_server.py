@@ -40,6 +40,7 @@ RF_DISTURBANCE_SCALE: float = 15.0       # dB range mapping 0→1 confidence
 RF_CONFIRM_THRESHOLD: float = 0.800      # high-confidence RF buzzer gate to avoid over-alerting
 RF_BUZZER_COOLDOWN_S: float = 3.0        # minimum seconds between per-node RF buzzer events
 RF_MIN_FUSION_WEIGHT: float = 0.30       # minimum sum(C_i) to compute fusion centroid
+MIC_ALARM_DBFS_THRESHOLD: float = -30.0  # distinct microphone alarm threshold
 
 # RF path-loss localization — log-distance model for indoor 2.4 GHz
 RF_PATH_LOSS_EXP: float = 2.5       # indoor exponent (2.0 = free space, 3–4 = obstructed)
@@ -87,6 +88,7 @@ def build_node_state(node_id: str) -> dict:
     "distance_baseline_cm": None,
     "distance_baseline_samples": 0,
     "mic_rms": None,
+    "mic_alarm_active": False,
     "sensor_status": "UNKNOWN",
     "sensor_ok": False,
     "audio_ready": False,
@@ -473,6 +475,14 @@ def update_motion_state(node: dict, packet: dict) -> None:
   except (TypeError, ValueError):
     mic_rms_value = None
 
+  mic_enabled_value = bool(raw.get("mic_enabled", node.get("mic_enabled", False)))
+  mic_dbfs = (20.0 * math.log10(max(mic_rms_value, 1e-6))) if mic_rms_value is not None else None
+  mic_alarm_active = bool(
+    mic_enabled_value
+    and mic_dbfs is not None
+    and mic_dbfs >= MIC_ALARM_DBFS_THRESHOLD
+  )
+
   motion_active = state.get("state") == "HOLD"
   motion_label = "CLEAR"
 
@@ -563,6 +573,7 @@ def update_motion_state(node: dict, packet: dict) -> None:
   node["strength"] = state.get("strength", 0)
   node["distance_cm"] = distance_value
   node["mic_rms"] = mic_rms_value
+  node["mic_alarm_active"] = mic_alarm_active
   node["sensor_status"] = sensor_status
   node["sensor_ok"] = sensor_ok
   node["audio_ready"] = bool(raw.get("audio_ready", False))
@@ -937,6 +948,8 @@ HTML_PAGE = """
     let speakerSequenceRunning = false;
     const lastRfState = {};        // nodeId -> previous rf_state for buzzer transition
     const rfBuzzerCooldownAt = {}; // nodeId -> ms timestamp of last RF buzzer
+    const lastMicAlarmState = {};  // nodeId -> previous mic threshold state
+    const micAlarmCooldownAt = {}; // nodeId -> ms timestamp of last mic alarm
     const lastEvents = {};         // nodeId -> last event string for card display
     const beaconHudEl = document.getElementById('beaconHud');
 
@@ -1029,6 +1042,26 @@ HTML_PAGE = """
       osc.connect(gain);
       osc.start(now);
       osc.stop(now + 1.0);
+    }
+
+    // Microphone alarm — distinct from the TF-Luna ping and RF buzzer.
+    async function playMicAlarmBeep() {
+      const ctx = getAudioContext();
+      if (!ctx) return;
+      if (ctx.state === 'suspended') { try { await ctx.resume(); } catch { return; } }
+      const now = ctx.currentTime;
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.linearRampToValueAtTime(0.13, now + 0.025);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.24);
+      gain.connect(ctx.destination);
+      const osc = ctx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.setValueAtTime(620, now);
+      osc.frequency.exponentialRampToValueAtTime(980, now + 0.12);
+      osc.connect(gain);
+      osc.start(now);
+      osc.stop(now + 0.24);
     }
 
     function triggerPhaseTracer(nodeId, mode = 'CONFIRMING_TARGET') {
@@ -2043,6 +2076,20 @@ HTML_PAGE = """
           }
         }
         lastRfState[node.node_id] = currRfState;
+
+        // Microphone threshold alarm: rising edge only, with a five-second cooldown.
+        const prevMicAlarm = lastMicAlarmState[node.node_id] || false;
+        const currMicAlarm = Boolean(node.mic_alarm_active);
+        if (!prevMicAlarm && currMicAlarm) {
+          const now = Date.now();
+          const lastMicAlarm = micAlarmCooldownAt[node.node_id] || 0;
+          if (now - lastMicAlarm >= 5000) {
+            micAlarmCooldownAt[node.node_id] = now;
+            playMicAlarmBeep();
+            lastEvents[node.node_id] = `MIC SOUND ALARM - ${new Date().toLocaleTimeString()}`;
+          }
+        }
+        lastMicAlarmState[node.node_id] = currMicAlarm;
 
         lastNodeVisualState[node.node_id] = node.motion_label;
         updateNodeControl(node);
