@@ -807,13 +807,14 @@ HTML_PAGE = """
     /* Phase 6 — per-node RF card styles */
     .node-header { display:flex; align-items:baseline; justify-content:space-between; gap:8px; margin-bottom:5px; }
     .compass-badge { font-size:.60rem; color:var(--amber); letter-spacing:.14em; text-transform:uppercase; border:1px solid rgba(255,209,102,.35); border-radius:4px; padding:1px 5px; }
-    .rf-data-row, .tf-data-row, .last-event-row { font-size:.68rem; display:flex; align-items:center; gap:5px; flex-wrap:wrap; margin-bottom:3px; padding:4px 6px; border-radius:6px; background:rgba(6,14,10,.72); border:1px solid rgba(57,255,20,.10); }
+    .rf-data-row, .tf-data-row, .mic-data-row, .last-event-row { font-size:.68rem; display:flex; align-items:center; gap:5px; flex-wrap:wrap; margin-bottom:3px; padding:4px 6px; border-radius:6px; background:rgba(6,14,10,.72); border:1px solid rgba(57,255,20,.10); }
     .data-label { color:var(--muted); letter-spacing:.08em; text-transform:uppercase; font-size:.60rem; min-width:52px; }
     .data-sep { color:rgba(255,255,255,.18); margin:0 2px; }
     .rf-field-val { color:var(--neon); font-variant-numeric:tabular-nums; min-width:34px; font-size:.72rem; }
     .rf-sphere-val { color:var(--cyan); letter-spacing:.06em; text-transform:uppercase; font-size:.62rem; }
     .rf-sphere-val.confirming { color:var(--amber); text-shadow:0 0 8px rgba(255,209,102,.5); }
     .tf-luna-val { color:var(--neon); font-size:.70rem; font-variant-numeric:tabular-nums; }
+    .mic-db-val { color:var(--cyan); font-size:.70rem; font-variant-numeric:tabular-nums; }
     .last-event-row { border-color:rgba(68,215,255,.08); }
     .last-event-val { color:var(--cyan); font-size:.62rem; }
     .node-buttons { display:grid; gap:4px; margin-bottom:4px; }
@@ -864,6 +865,9 @@ HTML_PAGE = """
     const WALL_HEIGHT = 9;
     const WALL_THICKNESS = 0.25;
     const SENSOR_HEIGHT = 5; // 5-foot tripod mount
+    const MIC_DB_FLOOR = -60; // near silence
+    const MIC_DB_CEIL = -20;  // loud/close speech
+    const EQ_BAR_COUNT = 12;
     
     const ROOMS = {
       "FSS-N01": {
@@ -1400,6 +1404,31 @@ HTML_PAGE = """
         roomOutline.position.set(room.center[0], 0.05, room.center[2]);
         scene.add(roomOutline);
         room.outline = roomOutline;
+
+        // Neon-green mic equalizer: flat glowing segments laid on the floor, lighting up with mic level.
+        room.eqBars = [];
+        room.micLevelSmooth = 0.0;
+        const eqSpan = ROOM_WIDTH - 2.4;
+        const eqBarWidth = eqSpan / EQ_BAR_COUNT - 0.25;
+        const eqStartX = room.center[0] - eqSpan / 2 + eqBarWidth / 2;
+        const eqZ = room.center[2] + (ROOM_DEPTH / 2 - 1.4);
+        for (let i = 0; i < EQ_BAR_COUNT; i++) {
+          const barGeo = new THREE.PlaneGeometry(eqBarWidth, 1.1);
+          const barMat = new THREE.MeshBasicMaterial({
+            color: 0x123312,
+            transparent: true,
+            opacity: 0.14,
+            side: THREE.DoubleSide,
+            depthWrite: false,
+          });
+          const bar = new THREE.Mesh(barGeo, barMat);
+          bar.rotation.x = -Math.PI / 2;
+          bar.position.set(eqStartX + i * (eqBarWidth + 0.25), 0.07, eqZ);
+          bar.userData.baseColor = new THREE.Color(0x123312);
+          bar.userData.litColor = new THREE.Color(0x39ff14);
+          scene.add(bar);
+          room.eqBars.push(bar);
+        }
       });
 
       // Predator beacon — a single fused intruder estimate.
@@ -1570,6 +1599,17 @@ HTML_PAGE = """
         if (room.outline) {
           room.outline.material.opacity = Math.min(0.9, 0.18 + conf * 0.38 + (flashActive ? 0.14 : 0.0));
         }
+
+        if (Array.isArray(room.eqBars)) {
+          const micLevel = room.micLevelSmooth || 0;
+          const segStep = 1 / room.eqBars.length;
+          room.eqBars.forEach((bar, i) => {
+            const segFloor = i * segStep;
+            const litAmount = Math.max(0, Math.min(1, (micLevel - segFloor) / segStep));
+            bar.material.color.copy(bar.userData.baseColor).lerp(bar.userData.litColor, litAmount);
+            bar.material.opacity = 0.14 + litAmount * 0.80;
+          });
+        }
       });
 
       if (rfPositionMarker) {
@@ -1638,6 +1678,14 @@ HTML_PAGE = """
       const sirenActive = Boolean(node.siren_on);
       room.liveConfidence = rfConf;
       room.urgency = sirenActive ? 1.0 : isPredator ? 0.95 : rfState === 'CONFIRMING_TARGET' ? Math.max(0.72, rfConf) : rfConf;
+
+      // Mic equalizer level: normalize dBFS into 0-1 and smooth so bars animate cleanly.
+      const micRms = node.mic_enabled && node.mic_rms != null ? node.mic_rms : null;
+      const micDbfs = micRms != null ? 20 * Math.log10(Math.max(micRms, 1e-6)) : null;
+      const micNormalized = micDbfs != null
+        ? Math.max(0, Math.min(1, (micDbfs - MIC_DB_FLOOR) / (MIC_DB_CEIL - MIC_DB_FLOOR)))
+        : 0;
+      room.micLevelSmooth = (room.micLevelSmooth || 0) * 0.7 + micNormalized * 0.3;
 
       // RF confidence drives sphere scale (base geometry radius = 6 ft)
       sphere.userData.dynamicScale = Math.max(0.33, rfRadius / 6.0);
@@ -1804,6 +1852,10 @@ HTML_PAGE = """
               <span class=\"data-label\">TF-LUNA</span>
               <span class=\"tf-luna-val\" id=\"tfl-${node.node_id}\">READY</span>
             </div>
+            <div class=\"mic-data-row\">
+              <span class=\"data-label\">MIC</span>
+              <span class=\"mic-db-val\" id=\"micdb-${node.node_id}\">\u2014</span>
+            </div>
             <div class=\"node-buttons\" id=\"btns-${node.node_id}\"></div>
             <div class=\"last-event-row\">Last Event: <span class=\"last-event-val\" id=\"lev-${node.node_id}\">\u2014</span></div>
           `;
@@ -1888,6 +1940,18 @@ HTML_PAGE = """
       ui.micButton.disabled = !online;
       ui.micButton.dataset.active = String(micEnabled);
       ui.micButton.innerHTML = `MIC: ${micEnabled ? 'UNMUTED' : 'MUTED'}<small>${online ? '' : ' - offline'}</small>`;
+
+      // Mic dB level (only meaningful while unmuted and online)
+      const micDbEl = document.getElementById(`micdb-${node.node_id}`);
+      if (micDbEl) {
+        if (!online || !micEnabled || node.mic_rms == null) {
+          micDbEl.textContent = micEnabled && online ? 'LISTENING…' : '—';
+        } else {
+          const rms = Math.max(node.mic_rms, 1e-6);
+          const dbfs = 20 * Math.log10(rms);
+          micDbEl.textContent = `${dbfs.toFixed(1)} dBFS`;
+        }
+      }
 
       // Siren button
       const sirenState = online ? Boolean(node.siren_on) : false;

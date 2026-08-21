@@ -22,6 +22,12 @@
 #define AMP_LRC_PIN   D5
 #define AMP_DIN_PIN   D6
 
+// INMP441 I2S microphone — separate port from the amp (RX vs TX), L/R tied to GND (left channel)
+#define MIC_I2S_PORT  I2S_NUM_0
+#define MIC_SCK_PIN   D7
+#define MIC_WS_PIN    D8
+#define MIC_SD_PIN    D9
+
 #ifndef TF_LUNA_INT_PIN
 #define TF_LUNA_INT_PIN -1
 #endif
@@ -56,6 +62,10 @@ unsigned long last_audio_cmd_ms = 0;
 bool intercom_enabled = false;
 bool mic_enabled = false;
 bool startup_chime_replayed = false;
+bool mic_ready = false;
+float mic_rms_level = 0.0f;
+unsigned long last_mic_sample_ms = 0;
+const unsigned long MIC_SAMPLE_INTERVAL_MS = 100;
 
 // ── RF sensing ──────────────────────────────────────────────────────────────
 // WiFi RSSI: measures ambient 2.4 GHz field; changes with body absorption/reflection
@@ -200,6 +210,101 @@ void setupAudioOutput() {
     );
 
     audio_ready = true;
+}
+
+void setupMicInput() {
+    int8_t sck_gpio = digitalPinToGPIONumber(MIC_SCK_PIN);
+    int8_t ws_gpio = digitalPinToGPIONumber(MIC_WS_PIN);
+    int8_t sd_gpio = digitalPinToGPIONumber(MIC_SD_PIN);
+
+    if (sck_gpio < 0 || ws_gpio < 0 || sd_gpio < 0) {
+        Serial.printf(
+            "[%s] Mic pin remap failed: D7->%d D8->%d D9->%d\n",
+            NODE_NAME,
+            (int)sck_gpio,
+            (int)ws_gpio,
+            (int)sd_gpio
+        );
+        mic_ready = false;
+        return;
+    }
+
+    i2s_config_t mic_config = {
+        .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+        .sample_rate = 16000,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT, // INMP441 sends 24-bit data left-justified in a 32-bit frame
+        .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,   // L/R tied to GND selects the left channel
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+        .dma_buf_count = 4,
+        .dma_buf_len = 256,
+        .use_apll = false,
+        .tx_desc_auto_clear = false,
+        .fixed_mclk = 0
+    };
+
+    i2s_pin_config_t mic_pins = {
+        .bck_io_num = sck_gpio,
+        .ws_io_num = ws_gpio,
+        .data_out_num = I2S_PIN_NO_CHANGE,
+        .data_in_num = sd_gpio
+    };
+
+    esp_err_t install_err = i2s_driver_install(MIC_I2S_PORT, &mic_config, 0, NULL);
+    if (install_err != ESP_OK) {
+        Serial.printf("[%s] Mic init failed (driver): %d\n", NODE_NAME, (int)install_err);
+        mic_ready = false;
+        return;
+    }
+
+    esp_err_t pin_err = i2s_set_pin(MIC_I2S_PORT, &mic_pins);
+    if (pin_err != ESP_OK) {
+        Serial.printf("[%s] Mic init failed (pins): %d\n", NODE_NAME, (int)pin_err);
+        i2s_driver_uninstall(MIC_I2S_PORT);
+        mic_ready = false;
+        return;
+    }
+
+    Serial.printf(
+        "[%s] Mic GPIO map: SCK D7->%d, WS D8->%d, SD D9->%d\n",
+        NODE_NAME,
+        (int)sck_gpio,
+        (int)ws_gpio,
+        (int)sd_gpio
+    );
+
+    mic_ready = true;
+}
+
+// Reads a short mic block and updates the smoothed RMS level (0.0-1.0).
+// Only samples while mic_enabled is true, so muted nodes never capture audio.
+void updateMicLevel() {
+    if (!mic_ready) return;
+
+    if (!mic_enabled) {
+        mic_rms_level = 0.0f;
+        return;
+    }
+
+    const int SAMPLE_COUNT = 256;
+    int32_t samples[SAMPLE_COUNT];
+    size_t bytes_read = 0;
+
+    esp_err_t result = i2s_read(MIC_I2S_PORT, samples, sizeof(samples), &bytes_read, pdMS_TO_TICKS(15));
+    if (result != ESP_OK || bytes_read == 0) return;
+
+    int count = bytes_read / sizeof(int32_t);
+    double sum_sq = 0.0;
+    for (int i = 0; i < count; i++) {
+        // INMP441 24-bit sample is left-justified in the 32-bit word; shift down to get signed magnitude.
+        int32_t sample = samples[i] >> 8;
+        double normalized = sample / 8388608.0; // 2^23
+        sum_sq += normalized * normalized;
+    }
+
+    double rms = sqrt(sum_sq / count);
+    // Light EMA smoothing so the dashboard reading doesn't jitter frame-to-frame.
+    mic_rms_level = 0.35f * (float)rms + 0.65f * mic_rms_level;
 }
 
 void playTone(int frequency, int duration_ms, float amplitudePct = 1.0f) {
@@ -412,6 +517,8 @@ void setup() {
         playStartupChime();
     }
 
+    setupMicInput();
+
     Serial.printf("[%s] Ready.\n", NODE_NAME);
 
     // WiFi: background connect — RSSI used as ambient 2.4 GHz disturbance signal
@@ -447,6 +554,11 @@ void loop() {
         last_debug_scan_ms = now;
     }
 
+    if (now - last_mic_sample_ms >= MIC_SAMPLE_INTERVAL_MS) {
+        updateMicLevel();
+        last_mic_sample_ms = now;
+    }
+
     bool due = newLidarDataReady || (now - last_transmit >= TRANSMIT_INTERVAL);
     if (!due) return;
 
@@ -477,7 +589,7 @@ void loop() {
 
     int dist = get_TFLuna_Distance();
 
-    StaticJsonDocument<640> doc;
+    StaticJsonDocument<768> doc;
     doc["node_id"]      = NODE_NAME;
     doc["timestamp_ms"] = now;
     doc["sequence"]     = sequence_num++;
@@ -501,6 +613,11 @@ void loop() {
     doc["last_audio_cmd"] = last_audio_cmd;
     doc["last_audio_cmd_ms"] = last_audio_cmd_ms;
     doc["mic_enabled"] = mic_enabled;
+    if (mic_ready) {
+        doc["mic_rms"] = mic_rms_level;
+    } else {
+        doc["mic_rms"] = nullptr;
+    }
     doc["intercom_enabled"] = intercom_enabled;
     doc["supply_note"]  = "TF-Luna needs >=4.5V";
     // RF sensing fields
