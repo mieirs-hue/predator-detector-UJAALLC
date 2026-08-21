@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from jetson_engine import dashboard_server
 
@@ -102,6 +104,28 @@ class DashboardServerTests(unittest.TestCase):
         updated = dashboard_server.toggle_node_feature(node["node_id"], "mic", False)
         self.assertFalse(updated["mic_enabled"])
         self.assertEqual(updated["mic_state"], "MUTED")
+
+    def test_flight_data_recorder_starts_and_stops_on_threat_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            recorder = dashboard_server.FlightDataRecorder(Path(tmp_dir), cooldown_seconds=0.01)
+            original_recorder = dashboard_server.telemetry_recorder
+            dashboard_server.telemetry_recorder = recorder
+            try:
+                node = self.make_node()
+                dashboard_server.update_motion_state(node, self.make_predator_packet())
+                self.assertEqual(node["motion_label"], "PREDATOR_DETECTED")
+
+                dashboard_server.apply_telemetry_packet(self.make_predator_packet())
+                self.assertTrue(recorder.is_recording)
+                self.assertEqual(len(list(Path(tmp_dir).glob("threat_event_*.jsonl"))), 1)
+
+                dashboard_server.apply_telemetry_packet(self.make_clear_packet())
+                import time as _time
+                _time.sleep(0.02)
+                dashboard_server.apply_telemetry_packet(self.make_clear_packet())
+                self.assertFalse(recorder.is_recording)
+            finally:
+                dashboard_server.telemetry_recorder = original_recorder
 
     def test_cycle_speaker_sequence_includes_all_four_nodes(self) -> None:
         source = dashboard_server.__file__

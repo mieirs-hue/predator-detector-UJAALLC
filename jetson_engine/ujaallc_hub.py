@@ -248,6 +248,29 @@ async def serial_endpoint_handler(node_name: str) -> None:
                 )
                 if not raw_line:
                     continue
+
+                # Live microphone audio frame — distinct wire prefix, forwarded as-is
+                # to the dashboard without JSON parsing (it is not telemetry).
+                if raw_line.startswith("PCM8:"):
+                    audio_b64 = raw_line[len("PCM8:"):]
+                    audio_payload = json.dumps({
+                        "type": "AUDIO_FRAME",
+                        "node_id": node_name,
+                        "sample_rate": 8000,
+                        "encoding": "u8",
+                        "payload_b64": audio_b64,
+                    })
+                    if visualizer_clients:
+                        dead_audio = set()
+                        for c in list(visualizer_clients):
+                            try:
+                                await c.send(audio_payload)
+                            except Exception:
+                                dead_audio.add(c)
+                        for c in dead_audio:
+                            visualizer_clients.discard(c)
+                    continue
+
                 try:
                     packet = json.loads(raw_line)
                 except json.JSONDecodeError:

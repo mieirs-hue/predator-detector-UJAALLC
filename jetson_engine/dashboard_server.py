@@ -3,8 +3,10 @@ import json
 import logging
 import math
 import os
+import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Set
 
 import websockets
@@ -50,6 +52,60 @@ RF_GRID_CELLS: int = 8              # cells per side on 40×40 ft floor (8×8 = 
 RF_CELL_FT: float = 40.0 / RF_GRID_CELLS   # = 5 ft per cell
 RF_MULTILATERATION_ITERS: int = 12  # gradient-descent iterations for position refinement
 TF_LUNA_RF_FALLBACK_ENABLED: bool = False  # RF isolation mode: do not synthesize RF from TF-Luna
+RECORDER_COOLDOWN_SECONDS: float = 10.0    # keep recording this long after a threat clears
+RECORDER_LOG_DIR = Path(__file__).resolve().parent.parent / ".runtime-logs" / "threat_events"
+
+
+class FlightDataRecorder:
+  """Event-triggered telemetry logger — a 'black box' for threat windows only.
+
+  Records the full dashboard snapshot as JSON Lines while any node is in
+  CONFIRMING_TARGET or PREDATOR_DETECTED, plus a cooldown tail. This keeps
+  disk/CPU usage negligible since idle periods write nothing.
+  """
+
+  def __init__(self, log_dir: Path, cooldown_seconds: float = RECORDER_COOLDOWN_SECONDS) -> None:
+    self.log_dir = log_dir
+    self.log_dir.mkdir(parents=True, exist_ok=True)
+    self.cooldown_seconds = cooldown_seconds
+    self.is_recording = False
+    self.current_file = None
+    self.last_event_time = 0.0
+
+  def process_snapshot(self, snapshot: dict) -> None:
+    nodes = snapshot.get("nodes", [])
+    active = any(n.get("motion_label") in {"CONFIRMING_TARGET", "PREDATOR_DETECTED"} for n in nodes)
+    now = time.time()
+
+    if active:
+      self.last_event_time = now
+      if not self.is_recording:
+        self._start_recording()
+
+    if self.is_recording and (now - self.last_event_time > self.cooldown_seconds):
+      self._stop_recording()
+      return
+
+    if self.is_recording and self.current_file is not None:
+      self.current_file.write(json.dumps(snapshot) + "\n")
+      self.current_file.flush()
+
+  def _start_recording(self) -> None:
+    self.is_recording = True
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = self.log_dir / f"threat_event_{timestamp}.jsonl"
+    self.current_file = open(filename, "w", encoding="utf-8")
+    logging.info("[RECORDER] Threat detected — recording telemetry to %s", filename)
+
+  def _stop_recording(self) -> None:
+    self.is_recording = False
+    if self.current_file is not None:
+      self.current_file.close()
+      self.current_file = None
+    logging.info("[RECORDER] Threat cleared — recording stopped and secured.")
+
+
+telemetry_recorder = FlightDataRecorder(RECORDER_LOG_DIR)
 
 
 @asynccontextmanager
@@ -123,6 +179,7 @@ def build_initial_state() -> dict:
     "updated_at": None,
     "operation_mode": "FULLY_INTERACTIVE",
     "tf_luna_audio_enabled": True,
+    "rf_buzzer_enabled": True,
     "hub": {
       "connected": False,
       "last_seen": None,
@@ -160,6 +217,12 @@ def set_tf_luna_audio_enabled(enabled: bool) -> dict:
   return dashboard_state
 
 
+def set_rf_buzzer_enabled(enabled: bool) -> dict:
+  dashboard_state["rf_buzzer_enabled"] = bool(enabled)
+  dashboard_state["updated_at"] = datetime.now().isoformat()
+  return dashboard_state
+
+
 def get_node_state(node_id: str) -> dict | None:
   for node in dashboard_state["nodes"]:
     if node["node_id"] == node_id:
@@ -173,6 +236,8 @@ def snapshot_state(message: str | None = None) -> dict:
     "updated_at": datetime.now().isoformat(),
     "operation_mode": dashboard_state.get("operation_mode", "FULLY_INTERACTIVE"),
     "tf_luna_audio_enabled": bool(dashboard_state.get("tf_luna_audio_enabled", True)),
+    "rf_buzzer_enabled": bool(dashboard_state.get("rf_buzzer_enabled", True)),
+    "system_recording": telemetry_recorder.is_recording,
     "hub": dict(dashboard_state["hub"]),
     "latest_packet": dashboard_state["latest_packet"],
     "nodes": [dict(node) for node in dashboard_state["nodes"]],
@@ -631,6 +696,7 @@ def apply_telemetry_packet(packet: dict) -> str | None:
   }
   dashboard_state["latest_packet"] = packet
   dashboard_state["updated_at"] = datetime.now().isoformat()
+  telemetry_recorder.process_snapshot(snapshot_state())
   return node_id
 
 
@@ -776,6 +842,7 @@ HTML_PAGE = """
     .mode-switcher { display:grid; gap:6px; border:1px solid rgba(68,215,255,.28); border-radius:10px; background:rgba(8,18,14,.82); padding:8px; }
     .mode-switcher-title { margin:0; color:var(--amber); letter-spacing:.10em; text-transform:uppercase; font-size:.72rem; }
     .mode-switcher-actions { display:grid; grid-template-columns:1fr 1fr; gap:6px; }
+    .mode-button-full { grid-column: 1 / -1; }
     .mode-button { appearance:none; border:1px solid rgba(57,255,20,.24); background:linear-gradient(180deg, rgba(18,31,22,.96), rgba(8,12,10,.98)); color:var(--text); border-radius:10px; padding:8px 9px; font-family:inherit; font-size:.68rem; letter-spacing:.08em; text-transform:uppercase; text-align:left; cursor:pointer; }
     .mode-button[data-active="true"] { border-color:rgba(68,215,255,.88); background:linear-gradient(180deg, rgba(68,215,255,.16), rgba(8,12,10,.98)); box-shadow:0 0 0 1px rgba(68,215,255,.16), 0 0 18px rgba(68,215,255,.14); }
     .mode-readout { color:var(--muted); font-size:.68rem; line-height:1.25; }
@@ -831,10 +898,31 @@ HTML_PAGE = """
     .node-buttons { display:grid; gap:4px; margin-bottom:4px; }
     .intercom-future-btn { opacity:0.38; cursor:not-allowed !important; }
     .intercom-future-btn:hover { opacity:0.38; }
+    @keyframes blinker { 50% { opacity: 0; } }
+    #rec-indicator {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      background: rgba(255, 0, 0, 0.15);
+      border: 2px solid #ff3333;
+      color: #ff3333;
+      font-weight: bold;
+      padding: 8px 16px;
+      border-radius: 8px;
+      font-family: 'Consolas', 'Courier New', monospace;
+      font-size: 0.78rem;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      display: none;
+      animation: blinker 1s linear infinite;
+      z-index: 100;
+      box-shadow: 0 0 15px rgba(255, 0, 0, 0.5);
+    }
   </style>
 </head>
 <body>
   <div class=\"shell\">
+    <div id=\"rec-indicator\">REC · TACTICAL LOG ACTIVE</div>
     <div class=\"masthead\"><h1>FSS Fleet Dashboard</h1><div class=\"subtitle\">Visual Priority Mode</div></div>
     <div class=\"dashboard-grid\">
       <div class=\"stack\">
@@ -858,10 +946,13 @@ HTML_PAGE = """
           <div class=\"control-readout\">
             <strong id=\"dashboardMode\">Blue acoustic standby</strong>
             <div class=\"mode-readout\" id=\"tfLunaAudioReadout\">TF-Luna audio OFF · RF isolation active</div>
+            <div class=\"mode-readout\" id=\"rfBuzzerAudioReadout\">RSSI/FSSS buzzer ON · guard alert active</div>
+            <div class=\"mode-readout\" id=\"micListenReadout\">Live mic relay: idle</div>
           </div>
           <div class=\"mode-switcher-actions\">
             <button class=\"mode-button\" id=\"btn-tfluna-audio\" data-active=\"false\">TF-Luna Audio: OFF</button>
-            <button class=\"mode-button\" id=\"btn-mode-interactive\" data-active=\"true\">Interactive Mode</button>
+            <button class=\"mode-button\" id=\"btn-rf-buzzer-audio\" data-active=\"true\">RSSI/FSSS: ON</button>
+            <button class=\"mode-button mode-button-full\" id=\"btn-mode-interactive\" data-active=\"true\">Interactive Mode</button>
           </div>
         </div>
         <div class=\"control-grid\" id=\"controlPanel\"></div>
@@ -959,6 +1050,89 @@ HTML_PAGE = """
       if (!audioContext) audioContext = new AudioCtx();
       return audioContext;
     }
+
+    // ── Live microphone relay playback ──────────────────────────────────────
+    // Decodes unsigned 8-bit PCM frames from the currently unmuted node and
+    // schedules them back-to-back so the Security Guard can listen live.
+    // A small jitter buffer (2 frames) absorbs network timing variance so the
+    // first moments of a listen session don't click/pop from underruns.
+    const MIC_JITTER_PREBUFFER = 2;
+    let micRelayPlaybackTime = 0;
+    let micRelayNodeId = null;
+    let micRelayLastFrameAt = 0;
+    let micJitterQueue = [];
+    let micJitterPrimed = false;
+    const micListenReadoutEl = document.getElementById('micListenReadout');
+
+    function base64ToUint8Array(b64) {
+      const binary = atob(b64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    function scheduleMicBuffer(ctx, buffer) {
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+      const now = ctx.currentTime;
+      if (micRelayPlaybackTime < now) {
+        micRelayPlaybackTime = now + 0.03;
+      }
+      source.start(micRelayPlaybackTime);
+      micRelayPlaybackTime += buffer.duration;
+    }
+
+    function playMicAudioFrame(nodeId, sampleRate, encoding, payloadB64) {
+      const ctx = getAudioContext();
+      if (!ctx || encoding !== 'u8' || !payloadB64) return;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+
+      if (nodeId !== micRelayNodeId) {
+        // New listening session — reset the jitter buffer and playback cursor.
+        micRelayNodeId = nodeId;
+        micRelayPlaybackTime = 0;
+        micJitterQueue = [];
+        micJitterPrimed = false;
+      }
+      micRelayLastFrameAt = Date.now();
+
+      const bytes = base64ToUint8Array(payloadB64);
+      if (bytes.length === 0) return;
+
+      const buffer = ctx.createBuffer(1, bytes.length, sampleRate);
+      const channel = buffer.getChannelData(0);
+      for (let i = 0; i < bytes.length; i++) {
+        channel[i] = (bytes[i] - 128) / 127.5;
+      }
+
+      if (!micJitterPrimed) {
+        micJitterQueue.push(buffer);
+        if (micJitterQueue.length >= MIC_JITTER_PREBUFFER) {
+          micJitterPrimed = true;
+          micJitterQueue.forEach((buf) => scheduleMicBuffer(ctx, buf));
+          micJitterQueue = [];
+        }
+      } else {
+        scheduleMicBuffer(ctx, buffer);
+      }
+
+      if (micListenReadoutEl) {
+        micListenReadoutEl.textContent = `Live mic relay: ${nodeId} listening`;
+      }
+    }
+
+    setInterval(() => {
+      if (!micListenReadoutEl) return;
+      if (micRelayNodeId && Date.now() - micRelayLastFrameAt > 1500) {
+        micRelayNodeId = null;
+        micListenReadoutEl.textContent = 'Live mic relay: idle';
+      }
+    }, 500);
 
     async function playWebSirenTone(durationMs = 500) {
       const ctx = getAudioContext();
@@ -1773,6 +1947,8 @@ HTML_PAGE = """
     const dashboardModeEl = document.getElementById('dashboardMode');
     const tfLunaAudioReadoutEl = document.getElementById('tfLunaAudioReadout');
     const tfLunaAudioButton = document.getElementById('btn-tfluna-audio');
+    const rfBuzzerAudioReadoutEl = document.getElementById('rfBuzzerAudioReadout');
+    const rfBuzzerAudioButton = document.getElementById('btn-rf-buzzer-audio');
     const modeInteractiveButton = document.getElementById('btn-mode-interactive');
     const modeAutomaticButton = document.getElementById('btn-mode-automatic');
     const sirenTestButton = document.getElementById('btn-siren-test');
@@ -1818,6 +1994,21 @@ HTML_PAGE = """
       }
     }
 
+    function sendRfBuzzerEnabled(enabled) {
+      if (!isSocketOpen()) {
+        if (rfBuzzerAudioReadoutEl) {
+          rfBuzzerAudioReadoutEl.textContent = 'Dashboard socket not connected';
+        }
+        return;
+      }
+      socket.send(JSON.stringify({ type: 'rf_buzzer_audio', enabled }));
+      if (rfBuzzerAudioReadoutEl) {
+        rfBuzzerAudioReadoutEl.textContent = enabled
+          ? 'Requesting RSSI/FSSS buzzer ON'
+          : 'Requesting RSSI/FSSS buzzer OFF';
+      }
+    }
+
     if (modeInteractiveButton) {
       modeInteractiveButton.addEventListener('click', () => sendDashboardMode('FULLY_INTERACTIVE'));
     }
@@ -1825,6 +2016,12 @@ HTML_PAGE = """
       tfLunaAudioButton.addEventListener('click', () => {
         const currentlyEnabled = tfLunaAudioButton.dataset.active === 'true';
         sendTfLunaAudioEnabled(!currentlyEnabled);
+      });
+    }
+    if (rfBuzzerAudioButton) {
+      rfBuzzerAudioButton.addEventListener('click', () => {
+        const currentlyEnabled = rfBuzzerAudioButton.dataset.active === 'true';
+        sendRfBuzzerEnabled(!currentlyEnabled);
       });
     }
     if (modeAutomaticButton) {
@@ -2020,6 +2217,7 @@ HTML_PAGE = """
       const activeNodes = nodes.filter((node) => node.motion).map((node) => node.label);
       const operationMode = String(state.operation_mode || 'FULLY_INTERACTIVE').toUpperCase();
       const tfLunaAudioEnabled = Boolean(state.tf_luna_audio_enabled);
+      const rfBuzzerEnabled = state.rf_buzzer_enabled !== false;
       const modeLabel = normalizeModeLabel(operationMode);
       statusEl.textContent = state.hub?.connected ? (activeNodes.length ? `Connected · ${modeLabel} · ${activeNodes.join(', ')} active` : `Connected · ${modeLabel} · all rooms clear`) : 'Waiting for telemetry…';
       if (dashboardModeEl) {
@@ -2033,6 +2231,19 @@ HTML_PAGE = """
       if (tfLunaAudioButton) {
         tfLunaAudioButton.dataset.active = String(tfLunaAudioEnabled);
         tfLunaAudioButton.textContent = `TF-Luna Audio: ${tfLunaAudioEnabled ? 'ON' : 'OFF'}`;
+      }
+      const recIndicatorEl = document.getElementById('rec-indicator');
+      if (recIndicatorEl) {
+        recIndicatorEl.style.display = state.system_recording === true ? 'block' : 'none';
+      }
+      if (rfBuzzerAudioReadoutEl) {
+        rfBuzzerAudioReadoutEl.textContent = rfBuzzerEnabled
+          ? 'RSSI/FSSS buzzer ON · guard alert active'
+          : 'RSSI/FSSS buzzer OFF · silenced for troubleshooting';
+      }
+      if (rfBuzzerAudioButton) {
+        rfBuzzerAudioButton.dataset.active = String(rfBuzzerEnabled);
+        rfBuzzerAudioButton.textContent = `RSSI/FSSS: ${rfBuzzerEnabled ? 'ON' : 'OFF'}`;
       }
       if (modeInteractiveButton) {
         modeInteractiveButton.dataset.active = String(operationMode === 'FULLY_INTERACTIVE');
@@ -2070,7 +2281,9 @@ HTML_PAGE = """
           const lastBuzz = rfBuzzerCooldownAt[node.node_id] || 0;
           if (now - lastBuzz >= 3000) {
             rfBuzzerCooldownAt[node.node_id] = now;
-            playRfBuzzer();
+            if (rfBuzzerEnabled) {
+              playRfBuzzer();
+            }
             const ts = new Date().toLocaleTimeString();
             lastEvents[node.node_id] = `RF CONFIRMING_TARGET \u00b7 ${ts}`;
           }
@@ -2157,6 +2370,8 @@ HTML_PAGE = """
         const message = JSON.parse(event.data);
         if (message.type === 'dashboard_state') {
           renderDashboard(message);
+        } else if (message.type === 'audio_frame') {
+          playMicAudioFrame(message.node_id, message.sample_rate || 8000, message.encoding || 'u8', message.payload_b64);
         } else if (message.type === 'control_ack') {
           if (dashboardModeEl) {
             dashboardModeEl.textContent = message.message;
@@ -2262,6 +2477,17 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
               )
               continue
 
+            if command_type == "rf_buzzer_audio":
+              updated_state = set_rf_buzzer_enabled(bool(message.get("enabled", False)))
+              await websocket.send_text(json.dumps({
+                "type": "control_ack",
+                "message": f"RSSI/FSSS buzzer {'enabled' if updated_state['rf_buzzer_enabled'] else 'muted'}",
+              }))
+              await broadcast_state(
+                f"RSSI/FSSS buzzer {'enabled' if updated_state['rf_buzzer_enabled'] else 'muted'}"
+              )
+              continue
+
             if command_type != "control_command":
               continue
 
@@ -2323,6 +2549,22 @@ async def dashboard_websocket(websocket: WebSocket) -> None:
               continue
 
             if feature == "mic":
+              # Only one microphone may be live at a time — unmuting a node auto-mutes
+              # any other node so the live audio relay never overloads the serial link.
+              if enabled:
+                for other in dashboard_state["nodes"]:
+                  if other["node_id"] != node_id and other.get("mic_enabled"):
+                    muted_other = toggle_node_feature(other["node_id"], "mic", False)
+                    await send_hub_command({
+                      "event": "node_audio_command",
+                      "node_id": other["node_id"],
+                      "feature": "mic",
+                      "enabled": False,
+                      "issued_at": datetime.now().isoformat(),
+                    })
+                    if muted_other is not None:
+                      await broadcast_state(f"{other['node_id']} mic auto-muted (single-listener policy)")
+
               updated_node = toggle_node_feature(node_id, "mic", bool(enabled))
               audio_payload = {
                 "event": "node_audio_command",
@@ -2449,6 +2691,25 @@ async def connect_to_hub() -> None:
                     try:
                         payload = json.loads(raw_message)
                     except json.JSONDecodeError:
+                        continue
+                    # Live microphone audio frame — relay straight to browser clients,
+                    # bypassing node/motion state since it is not telemetry.
+                    if payload.get("type") == "AUDIO_FRAME":
+                        audio_json = json.dumps({
+                            "type": "audio_frame",
+                            "node_id": payload.get("node_id"),
+                            "sample_rate": payload.get("sample_rate", 8000),
+                            "encoding": payload.get("encoding", "u8"),
+                            "payload_b64": payload.get("payload_b64", ""),
+                        })
+                        dead_connections: List[WebSocket] = []
+                        for connection in dashboard_clients:
+                            try:
+                                await connection.send_text(audio_json)
+                            except Exception:
+                                dead_connections.append(connection)
+                        for connection in dead_connections:
+                            dashboard_clients.discard(connection)
                         continue
                     # Pass full hub envelope — apply_telemetry_packet reads zone_data internally
                     applied_node = apply_telemetry_packet(payload)

@@ -7,6 +7,7 @@
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
+#include <cctype>
 #include "secrets.h"
 
 #ifndef NODE_NAME
@@ -66,6 +67,42 @@ bool mic_ready = false;
 float mic_rms_level = 0.0f;
 unsigned long last_mic_sample_ms = 0;
 const unsigned long MIC_SAMPLE_INTERVAL_MS = 100;
+
+// Live mic audio relay — streamed only while mic_enabled, at most one node at a time
+// (enforced by the dashboard). 16kHz capture is decimated to 8kHz 8-bit PCM to keep
+// serial bandwidth low alongside the existing JSON telemetry.
+const int MIC_CHUNK_SAMPLES = 1600;       // 100ms @ 16kHz capture
+const float MIC_STREAM_GAIN = 4.0f;       // fixed gain so typical speech fills the 8-bit range
+static int32_t micRawSamples[MIC_CHUNK_SAMPLES];
+static uint8_t micPcm8[MIC_CHUNK_SAMPLES / 2];
+static const char BASE64_CHARS[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+void base64EncodeInto(const uint8_t *data, size_t len, String &out) {
+    out = "";
+    out.reserve(((len + 2) / 3) * 4 + 1);
+    size_t i = 0;
+    while (i + 3 <= len) {
+        uint32_t n = ((uint32_t)data[i] << 16) | ((uint32_t)data[i + 1] << 8) | data[i + 2];
+        out += BASE64_CHARS[(n >> 18) & 0x3F];
+        out += BASE64_CHARS[(n >> 12) & 0x3F];
+        out += BASE64_CHARS[(n >> 6) & 0x3F];
+        out += BASE64_CHARS[n & 0x3F];
+        i += 3;
+    }
+    size_t rem = len - i;
+    if (rem == 1) {
+        uint32_t n = ((uint32_t)data[i]) << 16;
+        out += BASE64_CHARS[(n >> 18) & 0x3F];
+        out += BASE64_CHARS[(n >> 12) & 0x3F];
+        out += "==";
+    } else if (rem == 2) {
+        uint32_t n = (((uint32_t)data[i]) << 16) | (((uint32_t)data[i + 1]) << 8);
+        out += BASE64_CHARS[(n >> 18) & 0x3F];
+        out += BASE64_CHARS[(n >> 12) & 0x3F];
+        out += BASE64_CHARS[(n >> 6) & 0x3F];
+        out += "=";
+    }
+}
 
 // ── RF sensing ──────────────────────────────────────────────────────────────
 // WiFi RSSI: measures ambient 2.4 GHz field; changes with body absorption/reflection
@@ -276,8 +313,9 @@ void setupMicInput() {
     mic_ready = true;
 }
 
-// Reads a short mic block and updates the smoothed RMS level (0.0-1.0).
-// Only samples while mic_enabled is true, so muted nodes never capture audio.
+// Reads a 100ms mic block, updates the smoothed RMS level, and (only while
+// mic_enabled) streams the same block as an 8-bit PCM audio frame so the
+// Security Guard can listen live from the Jetson/Roku display.
 void updateMicLevel() {
     if (!mic_ready) return;
 
@@ -286,25 +324,52 @@ void updateMicLevel() {
         return;
     }
 
-    const int SAMPLE_COUNT = 256;
-    int32_t samples[SAMPLE_COUNT];
-    size_t bytes_read = 0;
+    int totalSamples = 0;
+    unsigned long deadline = millis() + 150; // safety cap so a stalled I2S link can't hang the loop
+    while (totalSamples < MIC_CHUNK_SAMPLES && millis() < deadline) {
+        size_t bytes_read = 0;
+        esp_err_t result = i2s_read(
+            MIC_I2S_PORT,
+            micRawSamples + totalSamples,
+            (MIC_CHUNK_SAMPLES - totalSamples) * sizeof(int32_t),
+            &bytes_read,
+            pdMS_TO_TICKS(20)
+        );
+        if (result != ESP_OK) break;
+        int gotSamples = bytes_read / sizeof(int32_t);
+        if (gotSamples <= 0) break;
+        totalSamples += gotSamples;
+    }
+    if (totalSamples <= 0) return;
 
-    esp_err_t result = i2s_read(MIC_I2S_PORT, samples, sizeof(samples), &bytes_read, pdMS_TO_TICKS(15));
-    if (result != ESP_OK || bytes_read == 0) return;
-
-    int count = bytes_read / sizeof(int32_t);
     double sum_sq = 0.0;
-    for (int i = 0; i < count; i++) {
+    int pcmCount = 0;
+    for (int i = 0; i < totalSamples; i++) {
         // INMP441 24-bit sample is left-justified in the 32-bit word; shift down to get signed magnitude.
-        int32_t sample = samples[i] >> 8;
+        int32_t sample = micRawSamples[i] >> 8;
         double normalized = sample / 8388608.0; // 2^23
         sum_sq += normalized * normalized;
+
+        // Decimate 16kHz -> 8kHz for the audio stream (every other sample).
+        if ((i % 2) == 0 && pcmCount < (int)sizeof(micPcm8)) {
+            float scaled = (float)normalized * MIC_STREAM_GAIN * 127.0f;
+            int32_t s = (int32_t)scaled;
+            if (s > 127) s = 127;
+            if (s < -127) s = -127;
+            micPcm8[pcmCount++] = (uint8_t)(s + 128);
+        }
     }
 
-    double rms = sqrt(sum_sq / count);
+    double rms = sqrt(sum_sq / totalSamples);
     // Light EMA smoothing so the dashboard reading doesn't jitter frame-to-frame.
     mic_rms_level = 0.35f * (float)rms + 0.65f * mic_rms_level;
+
+    if (pcmCount > 0) {
+        String encoded;
+        base64EncodeInto(micPcm8, pcmCount, encoded);
+        Serial.print("PCM8:");
+        Serial.println(encoded);
+    }
 }
 
 void playTone(int frequency, int duration_ms, float amplitudePct = 1.0f) {
@@ -488,6 +553,22 @@ int get_TFLuna_Distance() {
 void setup() {
     Serial.begin(921600);
     delay(1000);
+
+    // Boot-power stagger: when all four boards share one USB hub/power rail,
+    // simultaneous startup chime + WiFi + BLE inrush current can brown out the
+    // later-enumerated boards. Spread each board's expensive init by node index
+    // (N01=0ms, N02=550ms, N03=1100ms, N04=1650ms) so peak current draw is staggered.
+    {
+        const char *name = NODE_NAME;
+        size_t len = strlen(name);
+        int nodeIndex = 0;
+        if (len >= 2 && isdigit((unsigned char)name[len - 2]) && isdigit((unsigned char)name[len - 1])) {
+            nodeIndex = ((name[len - 2] - '0') * 10 + (name[len - 1] - '0')) - 1;
+            if (nodeIndex < 0) nodeIndex = 0;
+        }
+        const unsigned long BOOT_STAGGER_STEP_MS = 550;
+        delay((unsigned long)nodeIndex * BOOT_STAGGER_STEP_MS);
+    }
 
     Serial.printf(
         "[%s] Pin map (logical D-pins): TF_SDA=%d TF_SCL=%d AMP_BCLK=%d AMP_LRC=%d AMP_DIN=%d TF_INT=%d\n",
