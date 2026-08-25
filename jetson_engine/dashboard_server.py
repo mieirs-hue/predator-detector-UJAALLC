@@ -53,6 +53,7 @@ RF_GRID_CELLS: int = 8              # cells per side on 40×40 ft floor (8×8 = 
 RF_CELL_FT: float = 40.0 / RF_GRID_CELLS   # = 5 ft per cell
 RF_MULTILATERATION_ITERS: int = 12  # gradient-descent iterations for position refinement
 TF_LUNA_RF_FALLBACK_ENABLED: bool = False  # RF isolation mode: do not synthesize RF from TF-Luna
+STATIC_RSSI_MARGIN_FALLBACK_ENABLED: bool = False  # legacy stopgap; superseded by the adaptive rf_state pipeline
 RECORDER_COOLDOWN_SECONDS: float = 10.0    # keep recording this long after a threat clears
 RECORDER_LOG_DIR = Path(__file__).resolve().parent.parent / ".runtime-logs" / "threat_events"
 
@@ -599,7 +600,7 @@ def update_motion_state(node: dict, packet: dict) -> None:
   elif sensor_status == "SENSOR_ERR" and not motion_active:
     motion_label = "SENSOR_ERR"
 
-  if not motion_active and effective_rf_rssi is not None:
+  if STATIC_RSSI_MARGIN_FALLBACK_ENABLED and not motion_active and effective_rf_rssi is not None:
     motion_active = effective_rf_rssi >= float(node["baseline_rssi"]) + rssi_margin
     if motion_active and motion_label == "CLEAR":
       motion_label = "CONFIRMING_TARGET"
