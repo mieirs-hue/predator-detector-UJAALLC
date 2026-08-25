@@ -76,7 +76,11 @@ class FlightDataRecorder:
 
   def process_snapshot(self, snapshot: dict) -> None:
     nodes = snapshot.get("nodes", [])
-    active = any(n.get("motion_label") in {"CONFIRMING_TARGET", "PREDATOR_DETECTED"} for n in nodes)
+    active = any(
+      n.get("motion_label") in {"CONFIRMING_TARGET", "PREDATOR_DETECTED"}
+      or n.get("rf_state") == "CONFIRMING_TARGET"
+      for n in nodes
+    )
     now = time.time()
 
     if active:
