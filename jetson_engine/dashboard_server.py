@@ -37,8 +37,9 @@ NODE_COMPASS: dict = {"FSS-N01": "NORTH", "FSS-N02": "EAST", "FSS-N03": "SOUTH",
 RF_ALPHA: float = 0.20
 RF_R_MIN: float = 2.0               # minimum confidence sphere radius (ft)
 RF_R_MAX: float = 20.0              # maximum confidence sphere radius (ft)
-RF_DISTURBANCE_THRESHOLD: float = 8.0    # dB from baseline before confidence rises
-RF_DISTURBANCE_SCALE: float = 15.0       # dB range mapping 0→1 confidence
+RF_DISTURBANCE_THRESHOLD: float = 3.0    # dB from baseline before confidence rises
+RF_DISTURBANCE_SCALE: float = 8.0        # dB range mapping 0→1 confidence
+RF_BASELINE_ALPHA: float = 0.002         # ~50s time constant at 10Hz so a walk-past is not absorbed
 RF_CONFIRM_THRESHOLD: float = 0.800      # high-confidence RF buzzer gate to avoid over-alerting
 RF_BUZZER_COOLDOWN_S: float = 3.0        # minimum seconds between per-node RF buzzer events
 RF_MIN_FUSION_WEIGHT: float = 0.30       # minimum sum(C_i) to compute fusion centroid
@@ -285,12 +286,16 @@ def update_rf_state(node: dict, rssi_value: float | None) -> None:
     node["rf_baseline"] = rssi_value
     return
 
-  # Baseline adapts slowly only while NORMAL to avoid chasing an active disturbance
-  if node["rf_state"] == "NORMAL":
-    node["rf_baseline"] = node["rf_baseline"] * 0.98 + rssi_value * 0.02
-
+  # Measured against the prior baseline: updating first would fold the current
+  # sample into its own reference and mask the disturbance.
   d = abs(rssi_value - node["rf_baseline"])
   c_raw = max(0.0, min(1.0, (d - threshold) / max(scale, 1e-6)))
+
+  # Frozen while disturbed so the baseline cannot learn the intruder away.
+  if c_raw <= 0.0 and node["rf_state"] == "NORMAL":
+    node["rf_baseline"] = (
+      node["rf_baseline"] * (1.0 - RF_BASELINE_ALPHA) + rssi_value * RF_BASELINE_ALPHA
+    )
   c_prev = float(node.get("rf_confidence_smooth", 0.0))
   c_smooth = RF_ALPHA * c_raw + (1.0 - RF_ALPHA) * c_prev
   c_smooth = max(confidence_floor, c_smooth)

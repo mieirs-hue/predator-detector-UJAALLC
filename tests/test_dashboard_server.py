@@ -163,12 +163,9 @@ class RfDisturbanceModelTests(unittest.TestCase):
     def test_rf_disturbance_is_absolute_deviation(self) -> None:
         node = self._fresh_node()
         node["rf_baseline"] = -65.0
-        # Baseline adapts first: -65*0.98 + (-45)*0.02 = -64.6
-        # d = |-45 - (-64.6)| = 19.6 → c_raw = (19.6-8)/15 ≈ 0.7733
         dashboard_server.update_rf_state(node, -45.0)
-        adapted_baseline = -65.0 * 0.98 + (-45.0) * 0.02
-        d = abs(-45.0 - adapted_baseline)
-        expected_c_raw = max(0.0, min(1.0, (d - 8.0) / 15.0))
+        d = abs(-45.0 - (-65.0))
+        expected_c_raw = max(0.0, min(1.0, (d - dashboard_server.RF_DISTURBANCE_THRESHOLD) / dashboard_server.RF_DISTURBANCE_SCALE))
         self.assertAlmostEqual(node["rf_confidence_raw"], expected_c_raw, places=3)
 
     # 3 — confidence is clamped to [0, 1]
