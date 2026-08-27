@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+import socket
 import time
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime
@@ -14,9 +15,17 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 from .config import ZONE_TOPOLOGY
+from .geometry import NODE_DEFINITIONS, NODE_NEIGHBORHOODS, NODE_POSITIONS as GENERATED_NODE_POSITIONS, fusion_weight
+from .telemetry_schema import canonical_to_legacy_packet, parse_telemetry_packet
+from .fusion_engine import SpatialTriangulationEngine
+from .spatial_occupancy import SpatialOccupancyGrid
 
 HUB_WS_URL = os.getenv("UJAALLC_HUB_URL", "ws://127.0.0.1:8765")
-NODE_ORDER = ["FSS-N01", "FSS-N02", "FSS-N03", "FSS-N04"]
+UDP_LISTEN_HOST = os.getenv("FSSS_UDP_HOST", "0.0.0.0")
+UDP_LISTEN_PORT = int(os.getenv("FSSS_UDP_PORT", "5007"))
+AUDIO_COMMAND_PORT = int(os.getenv("FSSS_AUDIO_COMMAND_PORT", "5008"))
+AUDIO_STREAM_PORT = int(os.getenv("FSSS_AUDIO_STREAM_PORT", "5009"))
+NODE_ORDER = [node.node_id for node in NODE_DEFINITIONS]
 LIGHTHOUSE_TO_NODE = {
   "FSS-N01": "FSS-N01",
   "FSS-N02": "FSS-N02",
@@ -25,13 +34,41 @@ LIGHTHOUSE_TO_NODE = {
 }
 
 # Node 3-D positions (Three.js units; 1 unit = 1 foot) for RF fusion centroid
-NODE_POSITIONS: dict = {
-    "FSS-N01": (-10.0, 5.0, -10.0),
-    "FSS-N02": (10.0, 5.0, -10.0),
-    "FSS-N03": (-10.0, 5.0, 10.0),
-    "FSS-N04": (10.0, 5.0, 10.0),
-}
+NODE_POSITIONS: dict = GENERATED_NODE_POSITIONS
 NODE_COMPASS: dict = {"FSS-N01": "NORTH", "FSS-N02": "EAST", "FSS-N03": "SOUTH", "FSS-N04": "WEST"}
+
+# Spiral detection fields — ring 0 is the 4-node reference core, rings 1/2 are the
+# two loops of the 20-node perimeter spiral. Boundary radii computed from the
+# generated topology (jetson_engine/geometry.py) rather than hardcoded guesses.
+FIELD_ZONE_BY_RING: dict = {
+  0: {"label": "INNER", "color": "#39ff14"},
+  1: {"label": "MAIN FORCE FIELD", "color": "#3399ff"},
+  2: {"label": "OUTER", "color": "#ffa500"},
+}
+
+
+def _compute_field_zone_boundaries() -> list[dict]:
+  radii_by_ring: dict[int, list[float]] = {}
+  for node in NODE_DEFINITIONS:
+    radius_ft = math.hypot(node.position[0], node.position[2])
+    radii_by_ring.setdefault(node.ring, []).append(radius_ft)
+
+  rings = sorted(radii_by_ring)
+  boundaries = []
+  for position, ring in enumerate(rings):
+    zone = FIELD_ZONE_BY_RING.get(ring, {"label": f"RING {ring}", "color": "#888888"})
+    max_radius = max(radii_by_ring[ring])
+    next_ring_radii = radii_by_ring.get(rings[position + 1]) if position + 1 < len(rings) else None
+    if next_ring_radii is not None:
+      boundary_radius_ft = (max_radius + min(next_ring_radii)) / 2.0
+    else:
+      boundary_radius_ft = max_radius + 3.0
+    boundaries.append({"ring": ring, "label": zone["label"], "color": zone["color"], "radius_ft": round(boundary_radius_ft, 2)})
+  return boundaries
+
+
+FIELD_ZONE_BOUNDARIES: list[dict] = _compute_field_zone_boundaries()
+RING_BY_NODE: dict = {node.node_id: node.ring for node in NODE_DEFINITIONS}
 
 # RF visualization parameters — initial values, not thesis-validated physical measurements
 RF_ALPHA: float = 0.20
@@ -43,6 +80,8 @@ RF_BASELINE_ALPHA: float = 0.002         # ~50s time constant at 10Hz so a walk-
 RF_CONFIRM_THRESHOLD: float = 0.800      # high-confidence RF buzzer gate to avoid over-alerting
 RF_BUZZER_COOLDOWN_S: float = 3.0        # minimum seconds between per-node RF buzzer events
 RF_MIN_FUSION_WEIGHT: float = 0.30       # minimum sum(C_i) to compute fusion centroid
+spatial_triangulation_engine = SpatialTriangulationEngine()
+occupancy_grid = SpatialOccupancyGrid(NODE_POSITIONS)
 MIC_ALARM_DBFS_THRESHOLD: float = -30.0  # distinct microphone alarm threshold
 
 # RF path-loss localization — log-distance model for indoor 2.4 GHz
@@ -56,6 +95,88 @@ TF_LUNA_RF_FALLBACK_ENABLED: bool = False  # RF isolation mode: do not synthesiz
 STATIC_RSSI_MARGIN_FALLBACK_ENABLED: bool = False  # legacy stopgap; superseded by the adaptive rf_state pipeline
 RECORDER_COOLDOWN_SECONDS: float = 10.0    # keep recording this long after a threat clears
 RECORDER_LOG_DIR = Path(__file__).resolve().parent.parent / ".runtime-logs" / "threat_events"
+udp_transport: asyncio.DatagramTransport | None = None
+audio_transport: asyncio.DatagramTransport | None = None
+audio_command_socket: socket.socket | None = None
+node_udp_endpoints: dict[str, tuple[str, int]] = {}
+
+
+def canonical_udp_packet(payload: bytes) -> dict[str, Any] | None:
+  """Validate a canonical node packet and adapt it to the dashboard pipeline."""
+  try:
+    decoded = json.loads(payload.decode("utf-8"))
+    packet = parse_telemetry_packet(decoded)
+  except (AttributeError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+    logging.warning("[UDP] Ignoring invalid telemetry packet: %s", exc)
+    return None
+  return canonical_to_legacy_packet(packet)
+
+
+class TelemetryProtocol(asyncio.DatagramProtocol):
+  def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+    packet = canonical_udp_packet(data)
+    if packet is not None:
+      asyncio.create_task(process_udp_packet(packet, addr))
+
+
+class AudioProtocol(asyncio.DatagramProtocol):
+  def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
+    try:
+      frame = json.loads(data.decode("utf-8"))
+      if frame.get("type") != "AUDIO_FRAME" or not frame.get("node_id"):
+        raise ValueError("unsupported audio frame")
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError) as exc:
+      logging.warning("[UDP AUDIO] Ignoring invalid audio frame: %s", exc)
+      return
+    asyncio.create_task(broadcast_audio_frame(frame))
+
+
+async def process_udp_packet(packet: dict, addr: tuple[str, int] | None = None) -> None:
+  node_id = apply_telemetry_packet(packet)
+  if node_id is not None:
+    if addr is not None:
+      node_udp_endpoints[node_id] = (addr[0], AUDIO_COMMAND_PORT)
+    message = f"{node_id} updated via UDP"
+    await broadcast_state(message)
+    await manager.broadcast(snapshot_state(message))
+
+
+async def start_udp_listener() -> asyncio.DatagramTransport:
+  loop = asyncio.get_running_loop()
+  transport, _ = await loop.create_datagram_endpoint(
+    TelemetryProtocol,
+    local_addr=(UDP_LISTEN_HOST, UDP_LISTEN_PORT),
+  )
+  logging.info("[UDP] Telemetry listener active on %s:%d", UDP_LISTEN_HOST, UDP_LISTEN_PORT)
+  return transport
+
+
+async def start_audio_listener() -> asyncio.DatagramTransport:
+  loop = asyncio.get_running_loop()
+  transport, _ = await loop.create_datagram_endpoint(
+    AudioProtocol,
+    local_addr=(UDP_LISTEN_HOST, AUDIO_STREAM_PORT),
+  )
+  logging.info("[UDP AUDIO] Listener active on %s:%d", UDP_LISTEN_HOST, AUDIO_STREAM_PORT)
+  return transport
+
+
+async def broadcast_audio_frame(frame: dict) -> None:
+  payload = json.dumps({
+    "type": "audio_frame",
+    "node_id": frame.get("node_id"),
+    "sample_rate": frame.get("sample_rate", 8000),
+    "encoding": frame.get("encoding", "u8"),
+    "payload_b64": frame.get("payload_b64", ""),
+  })
+  dead_connections: list[WebSocket] = []
+  for connection in dashboard_clients:
+    try:
+      await connection.send_text(payload)
+    except Exception:
+      dead_connections.append(connection)
+  for connection in dead_connections:
+    dashboard_clients.discard(connection)
 
 
 class FlightDataRecorder:
@@ -117,10 +238,25 @@ telemetry_recorder = FlightDataRecorder(RECORDER_LOG_DIR)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
   # Keep hub relay alive while the dashboard API is running.
+  global udp_transport
+  global audio_transport
+  global audio_command_socket
   relay_task = asyncio.create_task(connect_to_hub())
+  udp_transport = await start_udp_listener()
+  audio_transport = await start_audio_listener()
+  audio_command_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
   try:
     yield
   finally:
+    if udp_transport is not None:
+      udp_transport.close()
+      udp_transport = None
+    if audio_transport is not None:
+      audio_transport.close()
+      audio_transport = None
+    if audio_command_socket is not None:
+      audio_command_socket.close()
+      audio_command_socket = None
     relay_task.cancel()
     with suppress(asyncio.CancelledError):
       await relay_task
@@ -130,12 +266,17 @@ app = FastAPI(title="FSS Fleet Dashboard", version="0.1.0", lifespan=lifespan)
 
 
 def build_node_state(node_id: str) -> dict:
-  meta = ZONE_TOPOLOGY[node_id]
+  definition = next(node for node in NODE_DEFINITIONS if node.node_id == node_id)
+  meta = ZONE_TOPOLOGY.get(node_id, {})
+  field_zone = FIELD_ZONE_BY_RING.get(definition.ring, {"label": f"RING {definition.ring}", "color": "#888888"})
   return {
     "node_id": node_id,
     "label": meta.get("label", node_id),
     "zone_id": meta.get("zone_id", node_id),
     "color": meta.get("color", "#39ff14"),
+    "field_ring": definition.ring,
+    "field_label": field_zone["label"],
+    "field_color": field_zone["color"],
     "baseline_rssi": meta.get("baseline_rssi", -70),
     "motion_confirm_delta_cm": meta.get("motion_confirm_delta_cm", 20),
     "motion_predator_delta_cm": meta.get("motion_predator_delta_cm", 45),
@@ -176,6 +317,11 @@ def build_node_state(node_id: str) -> dict:
     # Directional inference — deferred; UNKNOWN until spatial evidence supports it
     "direction": "UNKNOWN",
     "direction_confidence": 0.0,
+    "position": list(definition.position),
+    "role": definition.role,
+    "ring": definition.ring,
+    "azimuth_deg": definition.azimuth_deg,
+    "neighbors": next(item.neighbors for item in NODE_NEIGHBORHOODS if item.node_id == node_id),
   }
 
 
@@ -193,12 +339,31 @@ def build_initial_state() -> dict:
     },
     "latest_packet": None,
     "nodes": [build_node_state(node_id) for node_id in NODE_ORDER],
+    "field_zones": FIELD_ZONE_BOUNDARIES,
+    "topology": {
+      node.node_id: {
+        "position": list(node.position),
+        "role": node.role,
+        "ring": node.ring,
+        "azimuth_deg": node.azimuth_deg,
+        "neighbors": next(item.neighbors for item in NODE_NEIGHBORHOODS if item.node_id == node.node_id),
+      }
+      for node in NODE_DEFINITIONS
+    },
     "rf_fusion": {
         "state": "NO_FUSION",
         "confidence": 0.0,
         "position": None,
         "active_nodes": [],
         "dominant_node": None,
+        "triangulation_cue": {
+          "state": "NO_TRIANGLE",
+          "confidence": 0.0,
+          "anchors": [],
+          "target_x": None,
+          "target_y": None,
+          "target_z": None,
+        },
     },
   }
 
@@ -247,6 +412,8 @@ def snapshot_state(message: str | None = None) -> dict:
     "hub": dict(dashboard_state["hub"]),
     "latest_packet": dashboard_state["latest_packet"],
     "nodes": [dict(node) for node in dashboard_state["nodes"]],
+    "field_zones": dashboard_state.get("field_zones", FIELD_ZONE_BOUNDARIES),
+    "topology": dashboard_state.get("topology", {}),
     "rf_fusion": dict(dashboard_state.get("rf_fusion", {})),
   }
   if message is not None:
@@ -267,6 +434,32 @@ async def broadcast_state(message: str | None = None) -> None:
 
   for connection in dead_connections:
     dashboard_clients.discard(connection)
+
+
+def dispatch_rf_buzzer_audio(node: dict, previous_rf_state: str, rf_state: str) -> None:
+  """Independent RSSI/FSSS 'CONF' alert: fires a buzzer (not siren) on RF disturbance confirmation."""
+  if rf_state == previous_rf_state or rf_state != "CONFIRMING_TARGET":
+    return
+  if not dashboard_state.get("rf_buzzer_enabled", True):
+    return
+
+  now = time.time()
+  if now - float(node.get("rf_last_buzzer_at") or 0.0) < RF_BUZZER_COOLDOWN_S:
+    return
+
+  try:
+    loop = asyncio.get_running_loop()
+  except RuntimeError:
+    return
+
+  node["rf_last_buzzer_at"] = now
+  loop.create_task(send_hub_command({
+    "event": "node_audio_command",
+    "node_id": node["node_id"],
+    "feature": "quiet_ping",
+    "enabled": True,
+    "issued_at": datetime.now().isoformat(),
+  }))
 
 
 def update_rf_state(node: dict, rssi_value: float | None) -> None:
@@ -321,7 +514,9 @@ def update_rf_state(node: dict, rssi_value: float | None) -> None:
   node["rf_confidence_raw"] = round(c_raw, 4)
   node["rf_confidence_smooth"] = round(c_smooth, 4)
   node["rf_sphere_radius"] = round(RF_R_MIN + c_for_radius * (RF_R_MAX - RF_R_MIN), 2)
+  previous_rf_state = node["rf_state"]
   node["rf_state"] = next_rf_state
+  dispatch_rf_buzzer_audio(node, previous_rf_state, next_rf_state)
 
 
 def compute_rf_fusion(nodes: list) -> dict:
@@ -341,7 +536,7 @@ def compute_rf_fusion(nodes: list) -> dict:
     pos = NODE_POSITIONS.get(nid)
     if pos is None:
       continue
-    c = float(node.get("rf_confidence_smooth", 0.0))
+    c = fusion_weight(float(node.get("rf_confidence_smooth", 0.0)), float(node.get("health", 1.0)))
     if c <= 0.0:
       continue
     wx += c * pos[0]
@@ -502,6 +697,36 @@ def compute_rf_probability_field(nodes: list) -> list:
   ]
 
 
+def dispatch_detection_audio(node: dict, previous_label: str, motion_label: str) -> None:
+  """TF-Luna ping only. Siren stays fully manual (yellow button); RF buzzer is dispatched separately from rf_state."""
+  if motion_label == previous_label:
+    return
+
+  if motion_label != "CONFIRMING_TARGET":
+    return
+  if not dashboard_state.get("tf_luna_audio_enabled", True):
+    return
+  feature = "ping"
+
+  now = time.time()
+  if now - float(node.get("tf_ping_last_at") or 0.0) < RF_BUZZER_COOLDOWN_S:
+    return
+
+  try:
+    loop = asyncio.get_running_loop()
+  except RuntimeError:
+    return
+
+  node["tf_ping_last_at"] = now
+  loop.create_task(send_hub_command({
+    "event": "node_audio_command",
+    "node_id": node["node_id"],
+    "feature": feature,
+    "enabled": True,
+    "issued_at": datetime.now().isoformat(),
+  }))
+
+
 def update_motion_state(node: dict, packet: dict) -> None:
   zone_data = packet.get("zone_data", {}) if isinstance(packet, dict) else {}
   state = zone_data.get("state", {}) if isinstance(zone_data, dict) else {}
@@ -636,8 +861,10 @@ def update_motion_state(node: dict, packet: dict) -> None:
     node["intercom_on"] = False
     node["auto_alert_engaged"] = False
 
+  previous_label = str(node.get("motion_label") or "CLEAR")
   node["motion"] = motion_active
   node["motion_label"] = motion_label
+  dispatch_detection_audio(node, previous_label, motion_label)
   node["motion_intensity"] = (
     "high" if motion_label == "PREDATOR_DETECTED"
     else "medium" if motion_label == "CONFIRMING_TARGET"
@@ -680,6 +907,12 @@ def update_motion_state(node: dict, packet: dict) -> None:
 
 
 def apply_telemetry_packet(packet: dict) -> str | None:
+  if packet.get("protocol") == "fsss.telemetry":
+    try:
+      packet = canonical_to_legacy_packet(parse_telemetry_packet(packet))
+    except (KeyError, TypeError, ValueError):
+      logging.warning("Rejected malformed canonical telemetry packet")
+      return None
   zone_data = packet.get("zone_data", {}) if isinstance(packet, dict) else {}
   lighthouse = zone_data.get("lighthouse") if isinstance(zone_data, dict) else None
   node_id = LIGHTHOUSE_TO_NODE.get(lighthouse or "")
@@ -697,8 +930,15 @@ def apply_telemetry_packet(packet: dict) -> str | None:
 
   update_motion_state(node, packet)
   dashboard_state["rf_fusion"] = compute_rf_fusion(dashboard_state["nodes"])
+  dashboard_state["rf_fusion"]["triangulation_cue"] = spatial_triangulation_engine.estimate(dashboard_state["nodes"])
   dashboard_state["rf_fusion"]["position_estimate"] = compute_rf_position_estimate(dashboard_state["nodes"])
   dashboard_state["rf_fusion"]["probability_field"] = compute_rf_probability_field(dashboard_state["nodes"])
+  occupancy_centroid = occupancy_grid.calculate_global_centroid(dashboard_state["nodes"])
+  dashboard_state["rf_fusion"]["occupancy_centroid"] = (
+    {"x": occupancy_centroid[0], "z": occupancy_centroid[1], "confidence": occupancy_centroid[2]}
+    if occupancy_centroid is not None else None
+  )
+  dashboard_state["rf_fusion"]["occupancy_target_lock"] = occupancy_grid.check_for_target_lock()
   dashboard_state["hub"] = {
     "connected": True,
     "last_seen": datetime.now().isoformat(),
@@ -771,6 +1011,21 @@ def stage_label_for_motion(motion_label: str) -> str:
 
 
 async def send_hub_command(payload: dict) -> bool:
+  node_id = payload.get("node_id")
+  if payload.get("event") == "node_audio_command" and node_id in node_udp_endpoints:
+    if audio_command_socket is None:
+      return False
+    try:
+      await asyncio.get_running_loop().run_in_executor(
+        None,
+        audio_command_socket.sendto,
+        json.dumps(payload).encode("utf-8"),
+        node_udp_endpoints[node_id],
+      )
+      return True
+    except OSError as exc:
+      logging.warning("[UDP AUDIO] Failed command to %s: %s", node_id, exc)
+      return False
   try:
     async with websockets.connect(HUB_WS_URL) as websocket:
       await websocket.send(json.dumps(payload))
@@ -980,6 +1235,7 @@ HTML_PAGE = """
     const MIC_DB_FLOOR = -60; // near silence
     const MIC_DB_CEIL = -20;  // loud/close speech
     const EQ_BAR_COUNT = 12;
+    const SPIRAL_NODE_COUNT = 24;
     
     const ROOMS = {
       "FSS-N01": {
@@ -1024,6 +1280,9 @@ HTML_PAGE = """
     let rfPositionRing = null;
     let beaconTargetPosition = null;
     let beaconTargetConfidence = 0;
+    let occupancyLockMarker = null;
+    let occupancyLockTargetPosition = null;
+    let occupancyLockActive = false;
 
     function ensureBeaconTargetPosition() {
       if (!beaconTargetPosition && window.THREE) {
@@ -1034,6 +1293,7 @@ HTML_PAGE = """
     
     let scene, camera, renderer, orbitControls;
     let threeInitialized = false;
+    let spiralArtworkGroup = null;
     const animatedSpheres = [];
     const nodeSpheres = {};
     const lastNodeVisualState = {};
@@ -1544,7 +1804,7 @@ HTML_PAGE = """
       scene.fog = new THREE.FogExp2(0x0b0e14, 0.008);
       
       camera = new THREE.PerspectiveCamera(45, width / height, 0.1, 1000);
-      camera.position.set(0, 38, 42);
+      camera.position.set(0, 62, 72);
       camera.lookAt(0, 0, 0);
       
       try {
@@ -1572,7 +1832,7 @@ HTML_PAGE = """
       scene.add(directionalLight);
       
       // FLOOR
-      const floorGeometry = new THREE.BoxGeometry(FLOOR_WIDTH, 0.15, FLOOR_DEPTH);
+      const floorGeometry = new THREE.BoxGeometry(110, 0.15, 110);
       const floorMaterial = new THREE.MeshStandardMaterial({ color: 0x090611, roughness: 0.9, metalness: 0.06 });
       const floor = new THREE.Mesh(floorGeometry, floorMaterial);
       floor.position.set(0, -0.075, 0);
@@ -1662,11 +1922,67 @@ HTML_PAGE = """
       rfPositionRing.position.y = -1.75;
       rfPositionMarker.add(rfPositionRing);
       scene.add(rfPositionMarker);
+
+      // Occupancy-grid target lock — distinct yellow box, separate from the RF predator beacon.
+      occupancyLockMarker = new THREE.Mesh(
+        new THREE.BoxGeometry(1.6, 1.6, 1.6),
+        new THREE.MeshBasicMaterial({ color: 0xffd700, transparent: true, opacity: 0.0, wireframe: true })
+      );
+      occupancyLockMarker.position.set(0, 2.6, 0);
+      occupancyLockMarker.visible = false;
+      scene.add(occupancyLockMarker);
       
       // ENGINEERING GRID (1-foot spacing)
-      const engineeringGrid = new THREE.GridHelper(40, 40, 0x1e2d42, 0x121a26);
+      const engineeringGrid = new THREE.GridHelper(110, 110, 0x1e2d42, 0x121a26);
       engineeringGrid.position.y = 0.01;
       scene.add(engineeringGrid);
+
+      // FSSS-24 artwork: a compact XY projection of the generated topology.
+      // The four core anchors stay at the Gully corners; N05-N24 follow the
+      // same golden-angle spiral used by the Jetson geometry registry.
+      spiralArtworkGroup = new THREE.Group();
+      const spiralPoints = [];
+      const spiralRadii = [24.0, 35.0, 47.0];
+      spiralRadii.forEach((radius, ringIndex) => {
+        const ring = new THREE.Mesh(
+          new THREE.RingGeometry(radius - 0.025, radius + 0.025, 96),
+          new THREE.MeshBasicMaterial({ color: ringIndex === 0 ? 0xffd166 : ringIndex === 1 ? 0x4dd9ff : 0xff6b6b, transparent: true, opacity: 0.18, side: THREE.DoubleSide })
+        );
+        ring.rotation.x = -Math.PI / 2;
+        ring.position.y = 0.08 + ringIndex * 0.01;
+        spiralArtworkGroup.add(ring);
+      });
+      for (let index = 0; index < SPIRAL_NODE_COUNT - 4; index += 1) {
+        const angle = (-35 + index * 35) * Math.PI / 180;
+        const radius = 24 + index * 1.2;
+        spiralPoints.push(new THREE.Vector3(radius * Math.cos(angle), 0.34 + (index % 3) * 0.18, radius * Math.sin(angle)));
+      }
+      const spiralLine = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints(spiralPoints),
+        new THREE.LineBasicMaterial({ color: 0x4dd9ff, transparent: true, opacity: 0.72 })
+      );
+      spiralArtworkGroup.add(spiralLine);
+      const artworkPositions = [
+        [-10, -10], [10, -10], [-10, 10], [10, 10],
+        ...spiralPoints.map((point) => [point.x, point.z]),
+      ];
+      artworkPositions.forEach(([x, z], index) => {
+        const isCore = index < 4;
+        const node = new THREE.Mesh(
+          new THREE.OctahedronGeometry(isCore ? 0.72 : 0.72, 0),
+          new THREE.MeshBasicMaterial({ color: isCore ? 0xffd166 : 0x4dd9ff, transparent: true, opacity: 0.92, wireframe: true })
+        );
+        node.position.set(x, isCore ? 5.0 : 0.9, z);
+        node.userData.spiralIndex = index + 1;
+        spiralArtworkGroup.add(node);
+      });
+      const coreMarker = new THREE.Mesh(
+        new THREE.CylinderGeometry(3.2, 3.2, 0.12, 48),
+        new THREE.MeshBasicMaterial({ color: 0xffd166, transparent: true, opacity: 0.16, wireframe: true })
+      );
+      coreMarker.position.y = 0.16;
+      spiralArtworkGroup.add(coreMarker);
+      scene.add(spiralArtworkGroup);
       
       // WALLS (wireframe style matching neon aesthetic)
       const wallMaterial = new THREE.MeshBasicMaterial({ color: 0x1e3a5f, wireframe: true });
@@ -1732,6 +2048,31 @@ HTML_PAGE = """
 
       });
       
+      // Large in-world Matrix signs identify the four Gully rooms.
+      const roomSigns = [
+        ['FSS-N01', "UNCLE JESSE'S OFFICE"],
+        ['FSS-N02', 'GARAGE'],
+        ['FSS-N03', "BABY'S ROOM"],
+        ['FSS-N04', 'ENTRYWAY'],
+      ];
+      roomSigns.forEach(([nodeId, text]) => {
+        const roomLabelCanvas = document.createElement('canvas');
+        roomLabelCanvas.width = 1024;
+        roomLabelCanvas.height = 160;
+        const roomLabelContext = roomLabelCanvas.getContext('2d');
+        roomLabelContext.font = '700 58px monospace';
+        roomLabelContext.textAlign = 'center';
+        roomLabelContext.textBaseline = 'middle';
+        roomLabelContext.shadowColor = '#00ff66';
+        roomLabelContext.shadowBlur = 18;
+        roomLabelContext.fillStyle = '#8dffb5';
+        roomLabelContext.fillText(text, 512, 80);
+        const roomSign = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(roomLabelCanvas), transparent: true, depthWrite: false }));
+        roomSign.scale.set(15, 2.35, 1);
+        roomSign.position.set(ROOMS[nodeId].center[0], 10.2, ROOMS[nodeId].center[2]);
+        scene.add(roomSign);
+      });
+
       // DIMENSION LABEL
       const labelCanvas = document.createElement('canvas');
       labelCanvas.width = 256; labelCanvas.height = 64;
@@ -1746,9 +2087,42 @@ HTML_PAGE = """
       labelSprite.scale.set(12, 3, 1);
       labelSprite.position.set(0, 12, -22);
       scene.add(labelSprite);
-      
+
       window.addEventListener('resize', onWindowResize);
       animate();
+    }
+
+    let fieldZoneRingsDrawn = false;
+
+    function drawFieldZoneRings(zones) {
+      if (fieldZoneRingsDrawn || !Array.isArray(zones) || zones.length === 0) return;
+      fieldZoneRingsDrawn = true;
+
+      zones.forEach((zone) => {
+        const radius = Number(zone.radius_ft) || 0;
+        if (radius <= 0) return;
+
+        const ring = new THREE.Mesh(
+          new THREE.RingGeometry(radius - 0.15, radius + 0.15, 96),
+          new THREE.MeshBasicMaterial({ color: zone.color, transparent: true, opacity: 0.45, side: THREE.DoubleSide })
+        );
+        ring.rotation.x = -Math.PI / 2;
+        ring.position.y = 0.02;
+        scene.add(ring);
+
+        const labelCanvas = document.createElement('canvas');
+        labelCanvas.width = 320; labelCanvas.height = 64;
+        const ctx = labelCanvas.getContext('2d');
+        ctx.fillStyle = zone.color;
+        ctx.font = 'bold 28px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`${zone.label} · ${radius.toFixed(0)}ft`, 160, 32);
+        const zoneLabelSprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(labelCanvas), transparent: true, depthWrite: false }));
+        zoneLabelSprite.scale.set(10, 2, 1);
+        zoneLabelSprite.position.set(radius, 0.6, 0);
+        scene.add(zoneLabelSprite);
+      });
     }
     
     function onWindowResize() {
@@ -1852,6 +2226,20 @@ HTML_PAGE = """
         }
       }
 
+      if (occupancyLockMarker) {
+        if (occupancyLockActive && occupancyLockTargetPosition) {
+          const floatY = 2.6 + Math.sin(animTime * 3.0) * 0.2;
+          occupancyLockMarker.position.lerp(
+            new THREE.Vector3(occupancyLockTargetPosition.x, floatY, occupancyLockTargetPosition.z),
+            0.18
+          );
+        }
+        occupancyLockMarker.rotation.y += occupancyLockActive ? 0.05 : 0.01;
+        const occupancyTargetOpacity = occupancyLockActive ? 0.9 : 0.0;
+        occupancyLockMarker.material.opacity += (occupancyTargetOpacity - occupancyLockMarker.material.opacity) * 0.16;
+        occupancyLockMarker.visible = occupancyLockActive || occupancyLockMarker.material.opacity > 0.02;
+      }
+
       orbitControls.update();
       renderer.render(scene, camera);
     }
@@ -1931,14 +2319,21 @@ HTML_PAGE = """
     // Update fused predator beacon using multilateration estimate.
     function updateRfHeatmap(rfFusion) {
       if (!rfFusion) return;
+      const cue = rfFusion.triangulation_cue;
       const pe = rfFusion.position_estimate;
-      if (pe && pe.state === 'ACTIVE' && pe.position_3d && (pe.confidence ?? 0) >= 0.30) {
-        const [px, py, pz] = pe.position_3d;
-        beaconTargetPosition.set(px, 2.3, pz);
-        beaconTargetConfidence = pe.confidence ?? 0;
+      const cueActive = cue && cue.state === 'ACTIVE' && cue.target_x != null && cue.target_z != null;
+      const target = cueActive
+        ? { position: [cue.target_x, cue.target_y ?? 2.3, cue.target_z], confidence: cue.confidence ?? 0, label: `Triangle cue · ${cue.anchors.join(', ')}` }
+        : pe && pe.state === 'ACTIVE' && pe.position_3d
+          ? { position: pe.position_3d, confidence: pe.confidence ?? 0, label: 'RF multilateration' }
+          : null;
+      if (target && target.confidence >= 0.30) {
+        const [px, py, pz] = target.position;
+        beaconTargetPosition.set(px, Math.max(2.3, py), pz);
+        beaconTargetConfidence = target.confidence;
         if (beaconHudEl) {
           beaconHudEl.classList.add('active');
-          beaconHudEl.innerHTML = `<strong>Predator Beacon</strong>Target locked · conf ${(beaconTargetConfidence * 100).toFixed(0)}%`;
+          beaconHudEl.innerHTML = `<strong>Predator Beacon</strong>${target.label} · conf ${(beaconTargetConfidence * 100).toFixed(0)}%`;
         }
       } else {
         beaconTargetConfidence = 0;
@@ -1946,6 +2341,16 @@ HTML_PAGE = """
           beaconHudEl.classList.remove('active');
           beaconHudEl.innerHTML = '<strong>Predator Beacon</strong>Inactive';
         }
+      }
+
+      // Occupancy-grid target lock: independent multi-modal confirmation, yellow box beacon.
+      const locks = rfFusion.occupancy_target_lock;
+      if (Array.isArray(locks) && locks.length > 0) {
+        const lock = locks.reduce((best, l) => (l.confidence > best.confidence ? l : best), locks[0]);
+        occupancyLockTargetPosition = { x: lock.x, z: lock.z };
+        occupancyLockActive = true;
+      } else {
+        occupancyLockActive = false;
       }
     }
 
@@ -2223,6 +2628,8 @@ HTML_PAGE = """
 
     function renderDashboard(state) {
       latestDashboardState = state;
+      initializeThreeSceneOnce();
+      drawFieldZoneRings(state.field_zones);
       const nodes = state.nodes || [];
       const activeNodes = nodes.filter((node) => node.motion).map((node) => node.label);
       const operationMode = String(state.operation_mode || 'FULLY_INTERACTIVE').toUpperCase();
@@ -2248,7 +2655,7 @@ HTML_PAGE = """
       }
       if (rfBuzzerAudioReadoutEl) {
         rfBuzzerAudioReadoutEl.textContent = rfBuzzerEnabled
-          ? 'RSSI/FSSS buzzer ON · guard alert active'
+          ? 'RSSI/FSSS buzzer ON · watching CONF thresholds'
           : 'RSSI/FSSS buzzer OFF · silenced for troubleshooting';
       }
       if (rfBuzzerAudioButton) {

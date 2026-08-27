@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from jetson_engine import dashboard_server
+from jetson_engine.telemetry_schema import TelemetryPacket, canonical_to_legacy_packet, parse_telemetry_packet
 
 
 class DashboardServerTests(unittest.TestCase):
@@ -37,6 +38,20 @@ class DashboardServerTests(unittest.TestCase):
                 },
             }
         }
+
+    def test_canonical_udp_packet_is_adapted_into_dashboard_state(self) -> None:
+        payload = b'{"protocol":"fsss.telemetry","version":"1.0.0","node_id":"FSS-N02","sequence":7,"esp_timestamp_ms":1234,"rf":{"rssi_dbm":-61},"lidar":{"distance_cm":287,"strength":812,"valid":true}}'
+
+        packet = dashboard_server.canonical_udp_packet(payload)
+
+        self.assertIsNotNone(packet)
+        self.assertEqual(dashboard_server.apply_telemetry_packet(packet), "FSS-N02")
+        self.assertEqual(dashboard_server.dashboard_state["latest_packet"], packet)
+        self.assertEqual(dashboard_server.get_node_state("FSS-N02")["rssi"], -61)
+
+    def test_udp_packet_rejects_noncanonical_json(self) -> None:
+        self.assertIsNone(dashboard_server.canonical_udp_packet(b'{"node_id":"FSS-N01"}'))
+        self.assertIsNone(dashboard_server.canonical_udp_packet(b'[]'))
 
     def test_automatic_mode_arms_audio_on_predator_alert(self) -> None:
         dashboard_server.set_operation_mode("FULLY_AUTOMATIC")
@@ -144,6 +159,42 @@ class DashboardServerTests(unittest.TestCase):
         self.assertIn("renderFallback2DScene", contents)
         self.assertIn("2D fallback mode", contents)
 
+    def test_dashboard_exposes_triangulation_cue(self) -> None:
+        state = dashboard_server.build_initial_state()
+        self.assertEqual(state["rf_fusion"]["triangulation_cue"]["state"], "NO_TRIANGLE")
+
+    def test_dashboard_contains_matrix_room_signs(self) -> None:
+        source = dashboard_server.__file__
+        with open(source, "r", encoding="utf-8") as handle:
+            contents = handle.read()
+        for label in ["BABY'S ROOM", "GARAGE", "UNCLE JESSE'S OFFICE", "ENTRYWAY"]:
+            self.assertIn(label, contents)
+
+    def test_initial_state_exposes_generated_topology(self) -> None:
+        state = dashboard_server.build_initial_state()
+        self.assertEqual(len(state["topology"]), 24)
+        self.assertEqual(state["topology"]["FSS-N17"]["ring"], 2)
+        self.assertEqual(len(state["topology"]["FSS-N17"]["neighbors"]), 5)
+
+    def test_canonical_packet_reaches_existing_dashboard_pipeline(self) -> None:
+        packet = TelemetryPacket(node_id="FSS-N17", sequence=8, esp_timestamp_ms=1200)
+        self.assertEqual(dashboard_server.apply_telemetry_packet(packet.to_dict()), "FSS-N17")
+        node = dashboard_server.get_node_state("FSS-N17")
+        self.assertEqual(node["last_packet"]["zone_data"]["raw_telemetry"]["sequence"], 8)
+
+
+class TelemetrySchemaTests(unittest.TestCase):
+    def test_canonical_packet_round_trip(self) -> None:
+        payload = TelemetryPacket(node_id="FSS-N17", sequence=18231, esp_timestamp_ms=12839421).to_dict()
+        parsed = parse_telemetry_packet(payload)
+        legacy = canonical_to_legacy_packet(parsed)
+        self.assertEqual(legacy["zone_data"]["lighthouse"], "FSS-N17")
+        self.assertEqual(legacy["zone_data"]["raw_telemetry"]["sequence"], 18231)
+
+    def test_canonical_packet_rejects_interpreted_only_payload(self) -> None:
+        with self.assertRaises(ValueError):
+            parse_telemetry_packet({"protocol": "fsss.dashboard", "node_id": "FSS-N17", "sequence": 1, "esp_timestamp_ms": 1})
+
 
 class RfDisturbanceModelTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -167,6 +218,19 @@ class RfDisturbanceModelTests(unittest.TestCase):
         d = abs(-45.0 - (-65.0))
         expected_c_raw = max(0.0, min(1.0, (d - dashboard_server.RF_DISTURBANCE_THRESHOLD) / dashboard_server.RF_DISTURBANCE_SCALE))
         self.assertAlmostEqual(node["rf_confidence_raw"], expected_c_raw, places=3)
+
+    def test_rf_baseline_freezes_during_disturbance(self) -> None:
+        node = self._fresh_node()
+        node["rf_baseline"] = -65.0
+        dashboard_server.update_rf_state(node, -45.0)
+        self.assertEqual(node["rf_baseline"], -65.0)
+
+    def test_rf_baseline_drifts_only_when_quiet(self) -> None:
+        node = self._fresh_node()
+        node["rf_baseline"] = -65.0
+        dashboard_server.update_rf_state(node, -65.5)
+        self.assertNotEqual(node["rf_baseline"], -65.0)
+        self.assertAlmostEqual(node["rf_baseline"], -65.001, places=3)
 
     # 3 — confidence is clamped to [0, 1]
     def test_rf_confidence_clamped_below_threshold(self) -> None:
@@ -252,6 +316,21 @@ class RfDisturbanceModelTests(unittest.TestCase):
         nodes[1]["rf_confidence_smooth"] = 0.4   # FSS-N02
         result = dashboard_server.compute_rf_fusion(nodes)
         self.assertEqual(result["dominant_node"], "FSS-N01")
+
+    def test_fsss24_geometry_is_generated(self) -> None:
+        self.assertEqual(len(dashboard_server.NODE_ORDER), 24)
+        self.assertEqual(dashboard_server.NODE_ORDER[:4], ["FSS-N01", "FSS-N02", "FSS-N03", "FSS-N04"])
+        self.assertIn("FSS-N24", dashboard_server.NODE_POSITIONS)
+        self.assertEqual(len(dashboard_server.NODE_NEIGHBORHOODS), 24)
+        self.assertTrue(all(len(item.neighbors) == 5 for item in dashboard_server.NODE_NEIGHBORHOODS))
+
+    def test_generated_node_state_contains_spatial_metadata(self) -> None:
+        node = dashboard_server.build_node_state("FSS-N17")
+        self.assertEqual(node["node_id"], "FSS-N17")
+        self.assertEqual(node["role"], "PERIMETER")
+        self.assertEqual(node["ring"], 2)
+        self.assertEqual(len(node["position"]), 3)
+        self.assertEqual(len(node["neighbors"]), 5)
 
     # 10 — direction stays UNKNOWN without directional evidence
     def test_rf_direction_always_unknown_on_boot(self) -> None:
